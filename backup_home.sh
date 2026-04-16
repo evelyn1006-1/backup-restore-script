@@ -1,19 +1,26 @@
 #!/bin/bash
-# backup_home.sh - Create a compressed local backup of the home directory
-# Runs daily at 4:10 AM ET (3:10 AM CDT on this machine)
+# backup_home.sh - Create a local full or differential backup of the home directory.
 
 set -euo pipefail
 
 LOGFILE="/home/evelyn/backup.log"
 BACKUP_DIR="/home/evelyn/backups"
-HOME_DIR="/home/evelyn"
-RETENTION_DAYS=7  # keep backups for a week before cleaning up
+STATE_DIR="${BACKUP_DIR}/state"
+RESULT_FILE="${STATE_DIR}/last_result.json"
+HELPER="${BACKUP_DIR}/create_backup.py"
+RETENTION_DAYS=7
 PIGZ_PROCESSES=3
+MODE="${1:-full}"
 
-mkdir -p "$BACKUP_DIR" "$(dirname "$LOGFILE")"
+mkdir -p "$BACKUP_DIR" "$STATE_DIR" "$(dirname "$LOGFILE")"
 
 if ! command -v pigz >/dev/null 2>&1; then
     echo "pigz is required for parallel gzip compression" >&2
+    exit 1
+fi
+
+if [[ ! -x "$HELPER" ]]; then
+    echo "Backup helper is missing or not executable: $HELPER" >&2
     exit 1
 fi
 
@@ -22,39 +29,64 @@ log() {
 }
 
 log "=== Backup started ==="
+log "Requested mode: ${MODE}"
 
-# Create a timestamped tar.gz archive.
-TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
-ARCHIVE_FILE="$BACKUP_DIR/home_backup_${TIMESTAMP}.tar.gz"
+RESULT_JSON="$(python3 "$HELPER" --mode "$MODE" --retention-days "$RETENTION_DAYS" --pigz-processes "$PIGZ_PROCESSES")"
+printf '%s\n' "$RESULT_JSON" > "$RESULT_FILE"
 
-log "Creating tar.gz archive: $ARCHIVE_FILE"
-if ! tar -C "$HOME_DIR" \
-    --exclude="./.cache" \
-    --exclude="./.local" \
-    --exclude="./.local/share/Trash" \
-    --exclude="./backups" \
-    --exclude="./logs" \
-    --exclude="./.config/rclone" \
-    --exclude="./.gunicorn" \
-    --exclude="./bootstrap" \
-    --exclude="./.rustup" \
-    --exclude="./.julia" \
-    -cf - . \
-    2> >(tee -a "$LOGFILE" >&2) \
-    | pigz -6 -p "$PIGZ_PROCESSES" \
-    > "$ARCHIVE_FILE" \
-    2> >(tee -a "$LOGFILE" >&2); then
-    log "Archive failed; removing partial file"
-    rm -f "$ARCHIVE_FILE"
-    exit 1
+ARCHIVE_PATH="$(python3 - "$RESULT_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+print(payload["archive_path"])
+PY
+)"
+
+MANIFEST_PATH="$(python3 - "$RESULT_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+print(payload["manifest_path"])
+PY
+)"
+
+MODE_USED="$(python3 - "$RESULT_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+print(payload["mode_used"])
+PY
+)"
+
+DELETED_PATHS_PATH="$(python3 - "$RESULT_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+print(payload.get("deleted_paths_path") or "")
+PY
+)"
+
+ARCHIVE_SIZE="$(du -h "$ARCHIVE_PATH" | cut -f1)"
+log "Created ${MODE_USED} archive: ${ARCHIVE_PATH}"
+log "Manifest: ${MANIFEST_PATH}"
+if [[ -n "$DELETED_PATHS_PATH" ]]; then
+    log "Deleted paths manifest: ${DELETED_PATHS_PATH}"
 fi
+log "Archive created: ${ARCHIVE_SIZE}"
 
-ARCHIVE_SIZE=$(du -h "$ARCHIVE_FILE" | cut -f1)
-log "Archive created: $ARCHIVE_SIZE"
-
-# Clean up old local backups beyond retention
 log "Cleaning up local backups older than ${RETENTION_DAYS} days"
-find "$BACKUP_DIR" \( -name "home_backup_*.tar.gz" -o -name "home_backup_*.zip" \) -mtime +${RETENTION_DAYS} -delete 2>&1 | tee -a "$LOGFILE"
+find "$BACKUP_DIR" -maxdepth 1 \
+    \( -name "home_backup_*.tar.gz" -o -name "home_backup_*.manifest.json" -o -name "home_backup_*.deleted.txt" \) \
+    -mtime +${RETENTION_DAYS} -delete 2>&1 | tee -a "$LOGFILE"
+find "$STATE_DIR" \( -name "*.json" -o -name "*.txt" \) -mtime +${RETENTION_DAYS} -delete 2>&1 | tee -a "$LOGFILE"
 
 log "=== Backup finished ==="
 echo "" >> "$LOGFILE"

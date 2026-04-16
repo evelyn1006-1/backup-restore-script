@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -21,7 +22,11 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional on fresh restore hosts
+    def load_dotenv(*_args: Any, **_kwargs: Any) -> bool:
+        return False
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,6 +53,22 @@ class ChunkAttachment:
     url: str
     size: int
     message_id: str
+
+
+@dataclass
+class AttachmentInfo:
+    filename: str
+    size: int
+    url: str
+    message_id: str
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def parse_size_int(value: str | None) -> int | None:
@@ -206,6 +227,138 @@ def find_channel_id(
     return str(matches[0]["id"])
 
 
+def fetch_guilds(
+    session: requests.Session,
+    *,
+    api_base: str,
+    request_options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return request_json(
+        session,
+        "GET",
+        f"{api_base}/users/@me/guilds",
+        **request_options,
+    )
+
+
+def fetch_guild_channels(
+    session: requests.Session,
+    *,
+    api_base: str,
+    guild_id: str,
+    request_options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return request_json(
+        session,
+        "GET",
+        f"{api_base}/guilds/{guild_id}/channels",
+        **request_options,
+    )
+
+
+def latest_backup_channel_in_channels(channels: list[dict[str, Any]]) -> dict[str, Any] | None:
+    backup_category_ids = {
+        str(channel["id"])
+        for channel in channels
+        if channel.get("type") == 4 and channel.get("name") == "Backups"
+    }
+    candidates = [
+        channel
+        for channel in channels
+        if channel.get("type") == 0
+        and channel.get("parent_id") in backup_category_ids
+        and channel.get("name", "").startswith("backup-")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda channel: int(channel["id"]))
+
+
+def resolve_restore_channel(
+    session: requests.Session,
+    *,
+    api_base: str,
+    guild_id: str | None,
+    channel_id: str | None,
+    channel_name: str | None,
+    request_options: dict[str, Any],
+) -> tuple[str, str | None, str | None]:
+    if channel_id:
+        return channel_id, channel_name, guild_id
+
+    guilds: list[dict[str, Any]] | None = None
+    if not guild_id:
+        guilds = fetch_guilds(
+            session,
+            api_base=api_base,
+            request_options=request_options,
+        )
+        if not guilds:
+            raise SystemExit("This bot is not currently in any guilds.")
+
+    if channel_name:
+        if guild_id:
+            resolved_id = find_channel_id(
+                session,
+                api_base=api_base,
+                guild_id=guild_id,
+                channel_id=None,
+                channel_name=channel_name,
+                request_options=request_options,
+            )
+            return resolved_id, channel_name, guild_id
+
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        assert guilds is not None
+        for guild in guilds:
+            channels = fetch_guild_channels(
+                session,
+                api_base=api_base,
+                guild_id=str(guild["id"]),
+                request_options=request_options,
+            )
+            for channel in channels:
+                if channel.get("type") == 0 and channel.get("name") == channel_name:
+                    matches.append((guild, channel))
+        if not matches:
+            raise SystemExit(f"Could not find text channel named {channel_name!r} in any guild.")
+        selected_guild, selected_channel = max(matches, key=lambda item: int(item[1]["id"]))
+        return str(selected_channel["id"]), selected_channel.get("name"), str(selected_guild["id"])
+
+    if guild_id:
+        channels = fetch_guild_channels(
+            session,
+            api_base=api_base,
+            guild_id=guild_id,
+            request_options=request_options,
+        )
+        selected = latest_backup_channel_in_channels(channels)
+        if selected is None:
+            raise SystemExit(
+                f"Could not find any text channels starting with 'backup-' under a 'Backups' category in guild {guild_id}."
+            )
+        return str(selected["id"]), selected.get("name"), guild_id
+
+    assert guilds is not None
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for guild in guilds:
+        channels = fetch_guild_channels(
+            session,
+            api_base=api_base,
+            guild_id=str(guild["id"]),
+            request_options=request_options,
+        )
+        selected = latest_backup_channel_in_channels(channels)
+        if selected is not None:
+            candidates.append((guild, selected))
+    if not candidates:
+        raise SystemExit(
+            "Could not find any text channels starting with 'backup-' under a 'Backups' category in any guild."
+        )
+    selected_guild, selected_channel = max(candidates, key=lambda item: int(item[1]["id"]))
+    return str(selected_channel["id"]), selected_channel.get("name"), str(selected_guild["id"])
+
+
 def fetch_messages(
     session: requests.Session,
     *,
@@ -237,6 +390,87 @@ def fetch_messages(
             break
 
     return messages
+
+
+def attachment_infos(messages: list[dict[str, Any]]) -> list[AttachmentInfo]:
+    attachments: list[AttachmentInfo] = []
+    for message in messages:
+        for attachment in message.get("attachments", []):
+            attachments.append(
+                AttachmentInfo(
+                    filename=attachment["filename"],
+                    size=int(attachment["size"]),
+                    url=attachment["url"],
+                    message_id=message["id"],
+                )
+            )
+    return attachments
+
+
+def find_manifest_attachment(
+    messages: list[dict[str, Any]], archive_name: str | None = None
+) -> AttachmentInfo | None:
+    attachments = [
+        attachment
+        for attachment in attachment_infos(messages)
+        if attachment.filename.endswith(".manifest.json")
+    ]
+    if not attachments:
+        return None
+    if archive_name is None:
+        return attachments[0]
+
+    archive_stem = archive_name.removesuffix(".tar.gz")
+    for attachment in attachments:
+        if attachment.filename.startswith(archive_stem):
+            return attachment
+    return attachments[0]
+
+
+def find_attachment_by_name(messages: list[dict[str, Any]], filename: str) -> AttachmentInfo | None:
+    for attachment in attachment_infos(messages):
+        if attachment.filename == filename:
+            return attachment
+    return None
+
+
+def download_small_attachment(
+    session: requests.Session,
+    attachment: AttachmentInfo,
+    *,
+    timeout: int,
+    max_retries: int,
+    retry_initial_seconds: float,
+    retry_max_seconds: float,
+) -> bytes:
+    delay = retry_initial_seconds
+    last_response: requests.Response | None = None
+
+    for attempt in range(1, max_retries + 1):
+        response = session.get(attachment.url, timeout=timeout)
+        last_response = response
+        if response.status_code == 429:
+            try:
+                delay = float(response.json().get("retry_after", delay))
+            except ValueError:
+                pass
+            print(f"Rate limited while downloading {attachment.filename}; sleeping {delay:.1f}s")
+            time.sleep(delay)
+            delay = min(delay * 2, retry_max_seconds)
+            continue
+        if response.status_code >= 500 and attempt < max_retries:
+            print(
+                f"Download returned {response.status_code} for {attachment.filename}; "
+                f"retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, retry_max_seconds)
+            continue
+        response.raise_for_status()
+        return response.content
+
+    assert last_response is not None
+    last_response.raise_for_status()
 
 
 def collect_chunk_attachments(
@@ -399,6 +633,47 @@ def combine_chunks(chunks: list[ChunkAttachment], *, chunk_dir: Path, output_pat
     return digest.hexdigest()
 
 
+def download_archive_from_messages(
+    *,
+    messages: list[dict[str, Any]],
+    archive_name: str,
+    expected_chunks: int | None,
+    expected_size: int | None,
+    expected_sha256: str | None,
+    output_dir: Path,
+    overwrite: bool,
+    request_options: dict[str, Any],
+) -> tuple[Path, str]:
+    chunks = collect_chunk_attachments(messages, archive_name, expected_chunks)
+    print(f"chunks_found={len(chunks)}")
+
+    chunk_dir = output_dir / f"{archive_name}.chunks"
+    restored_path = output_dir / archive_name
+    download_chunks(
+        chunks,
+        chunk_dir=chunk_dir,
+        overwrite=overwrite,
+        request_options=request_options,
+    )
+
+    print(f"combining={restored_path}")
+    actual_sha256 = combine_chunks(chunks, chunk_dir=chunk_dir, output_path=restored_path)
+    actual_size = restored_path.stat().st_size
+
+    print(f"restored_path={restored_path}")
+    print(f"restored_sha256={actual_sha256}")
+    if expected_size is not None:
+        print(f"expected_size={expected_size}")
+        if actual_size != expected_size:
+            raise SystemExit(f"Restored size mismatch: got {actual_size}, expected {expected_size}")
+    if expected_sha256 is not None:
+        print(f"expected_sha256={expected_sha256}")
+        if actual_sha256 != expected_sha256:
+            raise SystemExit("Restored SHA256 mismatch.")
+
+    return restored_path, actual_sha256
+
+
 def assert_safe_tar_members(archive_path: Path) -> None:
     with tarfile.open(archive_path, "r:gz") as archive:
         for member in archive:
@@ -422,10 +697,17 @@ def extract_archive(archive_path: Path, *, output_dir: Path, extract_dir: Path |
     assert_safe_tar_members(archive_path)
 
     if extract_dir is None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        extract_dir = Path(
-            tempfile.mkdtemp(prefix=f"{archive_path.name}.extracted-", dir=output_dir)
-        )
+        archive_stem = archive_path.name
+        for suffix in (".tar.gz", ".tgz", ".tar"):
+            if archive_stem.endswith(suffix):
+                archive_stem = archive_stem[: -len(suffix)]
+                break
+        extract_dir = Path.home() / f"restored-{archive_stem}"
+        if extract_dir.exists():
+            if not overwrite:
+                raise SystemExit(f"Extraction directory already exists: {extract_dir}")
+            shutil.rmtree(extract_dir)
+        extract_dir.mkdir(parents=True)
     else:
         if extract_dir.exists():
             if not overwrite:
@@ -437,6 +719,25 @@ def extract_archive(archive_path: Path, *, output_dir: Path, extract_dir: Path |
         archive.extractall(extract_dir, filter=backup_restore_filter)
 
     return extract_dir
+
+
+def apply_deleted_paths(extract_dir: Path, deleted_paths_file: Path) -> None:
+    for line in deleted_paths_file.read_text(encoding="utf-8").splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        relative = Path(path[2:] if path.startswith("./") else path)
+        target = extract_dir / relative
+        if target.is_symlink() or target.is_file():
+            target.unlink(missing_ok=True)
+        elif target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def extract_into_existing_directory(archive_path: Path, extract_dir: Path) -> None:
+    assert_safe_tar_members(archive_path)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(extract_dir, filter=backup_restore_filter)
 
 
 def main() -> int:
@@ -456,10 +757,6 @@ def main() -> int:
 
     if not token:
         raise SystemExit(f"DISCORD_TOKEN is missing from {args.env_file}.")
-    if not guild_id and not args.channel_id:
-        raise SystemExit("GUILD_ID is missing. Set it in .env or pass --guild-id.")
-    if not archive_name:
-        raise SystemExit("Archive name is missing. Pass --archive-name or keep a parsable backup.log.")
 
     request_options = {
         "timeout": args.timeout,
@@ -471,11 +768,10 @@ def main() -> int:
     session = requests.Session()
     session.headers.update({"Authorization": f"Bot {token}"})
 
-    print(f"archive={archive_name}")
-    channel_id = find_channel_id(
+    channel_id, channel_name, guild_id = resolve_restore_channel(
         session,
         api_base=args.api_base,
-        guild_id=str(guild_id),
+        guild_id=str(guild_id) if guild_id else None,
         channel_id=args.channel_id,
         channel_name=channel_name,
         request_options=request_options,
@@ -490,34 +786,97 @@ def main() -> int:
     )
     print(f"messages_fetched={len(messages)}")
 
-    chunks = collect_chunk_attachments(messages, archive_name, expected_chunks)
-    print(f"chunks_found={len(chunks)}")
+    manifest_attachment = find_manifest_attachment(messages, archive_name)
+    manifest_data: dict | None = None
+    if manifest_attachment is not None:
+        manifest_data = json.loads(
+            download_small_attachment(session, manifest_attachment, **request_options).decode("utf-8")
+        )
+        print(f"manifest={manifest_attachment.filename}")
+        archive_name = archive_name or manifest_data.get("archive_name")
+        expected_size = expected_size if expected_size is not None else manifest_data.get("archive_size")
+        expected_chunks = (
+            expected_chunks if expected_chunks is not None else manifest_data.get("upload", {}).get("chunk_count")
+        )
+        expected_sha256 = expected_sha256 or manifest_data.get("archive_sha256")
 
-    chunk_dir = args.output_dir / f"{archive_name}.chunks"
-    restored_path = args.output_dir / archive_name
-    download_chunks(
-        chunks,
-        chunk_dir=chunk_dir,
+    if not archive_name:
+        raise SystemExit("Archive name is missing. Pass --archive-name or keep a parsable backup.log.")
+
+    print(f"archive={archive_name}")
+    restored_path, actual_sha256 = download_archive_from_messages(
+        messages=messages,
+        archive_name=archive_name,
+        expected_chunks=expected_chunks,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+        output_dir=args.output_dir,
         overwrite=args.overwrite,
         request_options=request_options,
     )
 
-    print(f"combining={restored_path}")
-    actual_sha256 = combine_chunks(chunks, chunk_dir=chunk_dir, output_path=restored_path)
-    actual_size = restored_path.stat().st_size
+    backup_type = manifest_data.get("backup_type") if manifest_data else "full"
+    if expected_size is not None or expected_sha256 is not None:
+        print("archive_verified=True")
+    else:
+        print("archive_verified=False")
 
-    print(f"restored_path={restored_path}")
-    print(f"restored_sha256={actual_sha256}")
-    if expected_size is not None:
-        print(f"expected_size={expected_size}")
-        if actual_size != expected_size:
-            raise SystemExit(f"Restored size mismatch: got {actual_size}, expected {expected_size}")
-    if expected_sha256 is not None:
-        print(f"expected_sha256={expected_sha256}")
-        if actual_sha256 != expected_sha256:
-            raise SystemExit("Restored SHA256 mismatch.")
+    if manifest_data and backup_type == "differential":
+        if not args.extract:
+            raise SystemExit("Differential restore requires --extract to reconstruct the full tree.")
 
-    print("archive_verified=True")
+        basis = manifest_data.get("basis") or {}
+        basis_channel_id = basis.get("channel_id")
+        basis_archive_name = basis.get("archive_name")
+        if not basis_channel_id or not basis_archive_name:
+            raise SystemExit("Differential manifest is missing basis channel information.")
+
+        print(f"basis_channel_id={basis_channel_id}")
+        basis_messages = fetch_messages(
+            session,
+            api_base=args.api_base,
+            channel_id=str(basis_channel_id),
+            request_options=request_options,
+        )
+        basis_manifest_attachment = find_manifest_attachment(basis_messages, basis_archive_name)
+        basis_manifest_data: dict | None = None
+        if basis_manifest_attachment is not None:
+            basis_manifest_data = json.loads(
+                download_small_attachment(session, basis_manifest_attachment, **request_options).decode("utf-8")
+            )
+        basis_restored_path, _ = download_archive_from_messages(
+            messages=basis_messages,
+            archive_name=basis_archive_name,
+            expected_chunks=(basis_manifest_data or {}).get("upload", {}).get("chunk_count"),
+            expected_size=(basis_manifest_data or {}).get("archive_size"),
+            expected_sha256=(basis_manifest_data or {}).get("archive_sha256"),
+            output_dir=args.output_dir,
+            overwrite=args.overwrite,
+            request_options=request_options,
+        )
+        extract_dir = extract_archive(
+            basis_restored_path,
+            output_dir=args.output_dir,
+            extract_dir=args.extract_dir,
+            overwrite=args.overwrite,
+        )
+        extract_into_existing_directory(restored_path, extract_dir)
+
+        deleted_name = manifest_data.get("deleted_paths_name")
+        if deleted_name:
+            deleted_attachment = find_attachment_by_name(messages, deleted_name)
+            if deleted_attachment is None:
+                raise SystemExit(f"Deleted-paths attachment {deleted_name!r} is missing.")
+            deleted_path = args.output_dir / deleted_name
+            deleted_path.write_bytes(
+                download_small_attachment(session, deleted_attachment, **request_options)
+            )
+            expected_deleted_sha = manifest_data.get("deleted_paths_sha256")
+            if expected_deleted_sha and sha256_file(deleted_path) != expected_deleted_sha:
+                raise SystemExit("Deleted-paths manifest SHA256 mismatch.")
+            apply_deleted_paths(extract_dir, deleted_path)
+        print(f"extracted_dir={extract_dir}")
+        return 0
 
     if args.extract:
         extract_dir = extract_archive(

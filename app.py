@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -29,7 +31,9 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 SIGNAL_FILE = BASE_DIR / "signal.txt"
 BACKUP_LOG = BASE_DIR / "backup.log"
-BACKUP_PATTERN = "home_backup_*.tar.gz"
+BACKUP_HELPER = BASE_DIR / "create_backup.py"
+BACKUP_STATE_DIR = BASE_DIR / "state"
+BACKUP_RESULT_FILE = BACKUP_STATE_DIR / "last_result.json"
 
 CATEGORY_NAME = "Backups"
 CHANNEL_PREFIX = "backup"
@@ -83,24 +87,19 @@ def append_backup_log(message: str) -> None:
         log_file.write("\n\n")
 
 
-def signal_is_set_and_clear() -> bool:
+def read_signal_command_and_clear() -> str | None:
     SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
     SIGNAL_FILE.touch(exist_ok=True)
 
     if SIGNAL_FILE.stat().st_size == 0:
-        return False
+        return None
 
     with SIGNAL_FILE.open("r+b") as signal:
+        contents = signal.read().decode("utf-8", errors="ignore")
         signal.seek(0)
         signal.truncate()
-    return True
-
-
-def latest_backup() -> Path | None:
-    backups = [path for path in BASE_DIR.glob(BACKUP_PATTERN) if path.is_file()]
-    if not backups:
-        return None
-    return max(backups, key=lambda path: path.stat().st_mtime)
+    commands = [char for char in contents if char in {"1", "2"}]
+    return commands[-1] if commands else "1"
 
 
 def sha256_file(path: Path) -> str:
@@ -109,6 +108,10 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def count_archive_files(path: Path) -> tuple[int | None, int | None]:
@@ -190,10 +193,102 @@ async def send_discord_file(
     return await with_discord_retries(f"upload {filename} to #{channel.name}", send_once)
 
 
+async def create_backup_artifacts(mode: str) -> dict:
+    if mode not in {"auto", "full"}:
+        raise RuntimeError(f"Unsupported backup creation mode: {mode}")
+
+    if not BACKUP_HELPER.exists():
+        raise RuntimeError(f"Backup helper is missing: {BACKUP_HELPER}")
+
+    command = [
+        "python3",
+        str(BACKUP_HELPER),
+        "--mode",
+        mode,
+        "--retention-days",
+        "7",
+        "--pigz-processes",
+        "3",
+        "--require-uploaded-basis",
+    ]
+
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        command,
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.stderr.strip():
+        logger.info("Backup helper stderr:\n%s", completed.stderr.strip())
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Backup creation failed: "
+            + (completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}")
+        )
+
+    try:
+        payload = json.loads(completed.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Backup helper returned invalid JSON: {completed.stdout!r}") from exc
+
+    BACKUP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_RESULT_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return payload
+
+
 async def delete_discord_channel(channel: discord.abc.GuildChannel, *, reason: str) -> None:
     await with_discord_retries(
         f"delete channel #{channel.name}",
         lambda: channel.delete(reason=reason),
+    )
+
+
+def backup_channel_prefix(backup_type: str) -> str:
+    return f"{CHANNEL_PREFIX}-full" if backup_type == "full" else f"{CHANNEL_PREFIX}-diff"
+
+
+def upload_manifest_payload(
+    manifest: dict,
+    *,
+    channel: discord.TextChannel,
+    finished_at: datetime,
+    chunk_count: int,
+) -> dict:
+    upload_info = {
+        "channel_id": str(channel.id),
+        "channel_name": channel.name,
+        "category_name": channel.category.name if channel.category else None,
+        "uploaded_at": finished_at.isoformat(timespec="seconds"),
+        "chunk_count": chunk_count,
+    }
+    payload = json.loads(json.dumps(manifest))
+    payload["upload"] = upload_info
+    if payload.get("basis") is not None:
+        payload["basis"].setdefault("channel_id", payload["basis"].get("channel_id"))
+        payload["basis"].setdefault("channel_name", payload["basis"].get("channel_name"))
+    return payload
+
+
+def write_upload_manifest_file(manifest_payload: dict, destination: Path) -> None:
+    destination.write_text(
+        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def persist_manifest_update(manifest_path: Path, manifest_payload: dict) -> None:
+    manifest_path.write_text(
+        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    state_manifest_name = manifest_path.name.replace(".manifest.json", ".json")
+    state_manifest_path = BACKUP_STATE_DIR / "manifests" / state_manifest_name
+    state_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    state_manifest_path.write_text(
+        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -311,9 +406,13 @@ async def get_or_create_backups_category(guild: discord.Guild) -> discord.Catego
 
 
 async def create_backup_channel(
-    guild: discord.Guild, category: discord.CategoryChannel, timestamp: datetime
+    guild: discord.Guild,
+    category: discord.CategoryChannel,
+    timestamp: datetime,
+    *,
+    prefix: str,
 ) -> discord.TextChannel:
-    base_name = f"{CHANNEL_PREFIX}-{timestamp.strftime('%Y%m%d-%H%M%S')}"
+    base_name = f"{prefix}-{timestamp.strftime('%Y%m%d-%H%M%S')}"
     channel_name = base_name
     suffix = 2
 
@@ -371,19 +470,24 @@ async def upload_archive_chunks(channel: discord.TextChannel, archive: Path) -> 
 
 def build_event_message(
     *,
+    manifest: dict,
     archive: Path,
-    archive_size: int,
-    archive_hash: str,
-    regular_files: int | None,
-    total_entries: int | None,
     chunk_count: int,
     channel: discord.TextChannel,
     started_at: datetime,
     finished_at: datetime,
     duration_seconds: float,
 ) -> str:
-    file_count = "unknown" if regular_files is None else f"{regular_files:,}"
-    entry_count = "unknown" if total_entries is None else f"{total_entries:,}"
+    archive_size = int(manifest["archive_size"])
+    archive_hash = manifest["archive_sha256"]
+    file_count = "unknown"
+    if manifest.get("regular_files") is not None:
+        file_count = f"{int(manifest['regular_files']):,}"
+    entry_count = "unknown"
+    if manifest.get("total_entries") is not None:
+        entry_count = f"{int(manifest['total_entries']):,}"
+    backup_type = manifest.get("backup_type", "full")
+    deleted_paths_count = manifest.get("deleted_paths_count")
     restore_commands = (
         "Restore bootstrap:",
         "export DISCORD_TOKEN='your-bot-token'",
@@ -392,18 +496,38 @@ def build_event_message(
     )
     manual_restore_command = f"cat '{archive.name}.part'* > '{archive.name}'"
 
-    return "\n".join(
+    details: list[str] = [
+        "Backup uploaded to Discord",
+        f"Type: {backup_type}",
+        f"Started: {started_at.isoformat(timespec='seconds')}",
+        f"Finished: {finished_at.isoformat(timespec='seconds')}",
+        f"Duration: {duration_seconds:.1f} seconds",
+        f"Channel: #{channel.name}",
+        f"Archive: {archive.name}",
+        f"Archive path: {archive}",
+        f"Size: {human_size(archive_size)} ({archive_size:,} bytes)",
+        f"Archive files: {file_count}",
+        f"Archive entries: {entry_count}",
+    ]
+    if manifest.get("changed_paths_count") is not None:
+        details.append(f"Changed paths: {int(manifest['changed_paths_count']):,}")
+    if deleted_paths_count is not None:
+        details.append(f"Deleted paths: {int(deleted_paths_count):,}")
+    basis = manifest.get("basis")
+    if basis:
+        basis_line = basis.get("archive_name", "unknown")
+        if basis.get("channel_name"):
+            basis_line = f"#{basis['channel_name']} ({basis_line})"
+        details.append(f"Basis full: {basis_line}")
+    previous_differential = manifest.get("previous_differential")
+    if previous_differential and previous_differential.get("archive_name"):
+        previous_line = previous_differential["archive_name"]
+        if previous_differential.get("channel_name"):
+            previous_line = f"#{previous_differential['channel_name']} ({previous_line})"
+        details.append(f"Previous differential: {previous_line}")
+
+    details.extend(
         (
-            "Backup uploaded to Discord",
-            f"Started: {started_at.isoformat(timespec='seconds')}",
-            f"Finished: {finished_at.isoformat(timespec='seconds')}",
-            f"Duration: {duration_seconds:.1f} seconds",
-            f"Channel: #{channel.name}",
-            f"Archive: {archive.name}",
-            f"Archive path: {archive}",
-            f"Size: {human_size(archive_size)} ({archive_size:,} bytes)",
-            f"Archive files: {file_count}",
-            f"Archive entries: {entry_count}",
             f"Chunks: {chunk_count:,} x up to {CHUNK_LABEL} ({CHUNK_SIZE:,} bytes)",
             f"SHA256: {archive_hash}",
             *restore_commands,
@@ -411,6 +535,7 @@ def build_event_message(
             "Verify: sha256sum the restored archive and compare it with the SHA256 above.",
         )
     )
+    return "\n".join(details)
 
 
 def split_discord_message(message: str) -> list[str]:
@@ -556,43 +681,63 @@ async def purge_backups_command(
     )
 
 
-async def handle_backup_signal(client: discord.Client) -> None:
+async def handle_backup_signal(client: discord.Client, signal_command: str) -> None:
     started_at = datetime.now().astimezone()
     monotonic_start = time.monotonic()
+    requested_mode = "full" if signal_command == "2" else "auto"
+
+    artifacts = await create_backup_artifacts(requested_mode)
+    archive = Path(artifacts["archive_path"])
+    manifest_path = Path(artifacts["manifest_path"])
+    manifest = load_json(manifest_path)
+    deleted_paths_path = (
+        Path(artifacts["deleted_paths_path"]) if artifacts.get("deleted_paths_path") else None
+    )
 
     guild = await get_target_guild(client)
     category = await get_or_create_backups_category(guild)
-    channel = await create_backup_channel(guild, category, started_at)
-
-    archive = latest_backup()
-    if archive is None:
-        message = "\n".join(
-            (
-                "Backup upload failed",
-                f"Time: {started_at.isoformat(timespec='seconds')}",
-                f"Channel: #{channel.name}",
-                f"Reason: no files matching {BACKUP_PATTERN} in {BASE_DIR}",
-            )
-        )
-        append_backup_log(message)
-        await send_discord_message(channel, message)
-        return
-
-    await send_discord_message(
-        channel, f"Uploading latest backup `{archive.name}` in {CHUNK_LABEL} chunks."
+    channel = await create_backup_channel(
+        guild,
+        category,
+        started_at,
+        prefix=backup_channel_prefix(manifest.get("backup_type", "full")),
     )
 
-    regular_files, total_entries = count_archive_files(archive)
-    archive_hash = sha256_file(archive)
+    await send_discord_message(
+        channel,
+        f"Uploading {manifest.get('backup_type', 'full')} backup `{archive.name}` in {CHUNK_LABEL} chunks.",
+    )
+
     chunk_count, archive_size = await upload_archive_chunks(channel, archive)
+    if deleted_paths_path is not None:
+        await send_discord_file(
+            channel,
+            content=f"Deleted paths manifest: `{deleted_paths_path.name}`",
+            path=deleted_paths_path,
+            filename=deleted_paths_path.name,
+        )
 
     finished_at = datetime.now().astimezone()
+    upload_manifest = upload_manifest_payload(
+        manifest,
+        channel=channel,
+        finished_at=finished_at,
+        chunk_count=chunk_count,
+    )
+    with tempfile.TemporaryDirectory(prefix="discord-backup-manifest-") as temp_dir_name:
+        temp_manifest = Path(temp_dir_name) / manifest_path.name
+        write_upload_manifest_file(upload_manifest, temp_manifest)
+        await send_discord_file(
+            channel,
+            content=f"Backup manifest: `{temp_manifest.name}`",
+            path=temp_manifest,
+            filename=temp_manifest.name,
+        )
+
+    persist_manifest_update(manifest_path, upload_manifest)
     message = build_event_message(
+        manifest=upload_manifest,
         archive=archive,
-        archive_size=archive_size,
-        archive_hash=archive_hash,
-        regular_files=regular_files,
-        total_entries=total_entries,
         chunk_count=chunk_count,
         channel=channel,
         started_at=started_at,
@@ -611,9 +756,10 @@ async def signal_loop(client: discord.Client) -> None:
 
     while not client.is_closed():
         try:
-            if signal_is_set_and_clear():
-                logger.info("Signal detected; starting backup upload")
-                await handle_backup_signal(client)
+            signal_command = read_signal_command_and_clear()
+            if signal_command is not None:
+                logger.info("Signal detected (%s); starting backup workflow", signal_command)
+                await handle_backup_signal(client, signal_command)
         except Exception as exc:
             logger.exception("Backup upload failed")
             append_backup_log(
