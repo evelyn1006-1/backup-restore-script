@@ -3,10 +3,11 @@
 #
 # Required:
 #   DISCORD_TOKEN
-#   and either RESTORE_CHANNEL_ID
-#   or RESTORE_GUILD_ID/GUILD_ID plus RESTORE_CHANNEL_NAME
 #
 # Optional:
+#   RESTORE_CHANNEL_ID
+#   RESTORE_GUILD_ID or GUILD_ID
+#   RESTORE_CHANNEL_NAME
 #   RESTORE_ARCHIVE_NAME
 #   RESTORE_EXPECTED_CHUNKS
 #   RESTORE_EXPECTED_SIZE
@@ -24,17 +25,6 @@ PYTHON="${PYTHON:-python3}"
 if [ -z "${DISCORD_TOKEN:-}" ]; then
     echo "DISCORD_TOKEN is not set. Run: export DISCORD_TOKEN='your-bot-token'" >&2
     exit 1
-fi
-
-if [ -z "${RESTORE_CHANNEL_ID:-}" ]; then
-    if [ -z "${RESTORE_CHANNEL_NAME:-}" ]; then
-        echo "Set RESTORE_CHANNEL_ID, or set RESTORE_CHANNEL_NAME with RESTORE_GUILD_ID/GUILD_ID." >&2
-        exit 1
-    fi
-    if [ -z "${RESTORE_GUILD_ID:-${GUILD_ID:-}}" ]; then
-        echo "Set RESTORE_GUILD_ID or GUILD_ID when using RESTORE_CHANNEL_NAME." >&2
-        exit 1
-    fi
 fi
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
@@ -209,8 +199,40 @@ def download(url, destination, expected_bytes, retries=6):
             delay = min(delay * 2, 120.0)
 
 
+def fetch_guilds():
+    return request_json(
+        f"{api_base}/users/@me/guilds",
+        action="Listing guilds for this bot",
+    )
+
+
+def fetch_guild_channels(guild_id_to_fetch):
+    return request_json(
+        f"{api_base}/guilds/{urllib.parse.quote(guild_id_to_fetch)}/channels",
+        action=f"Listing channels for guild {guild_id_to_fetch}",
+    )
+
+
+def latest_backup_channel_in_channels(channels):
+    backup_category_ids = {
+        str(channel["id"])
+        for channel in channels
+        if channel.get("type") == 4 and channel.get("name") == "Backups"
+    }
+    candidates = [
+        channel
+        for channel in channels
+        if channel.get("type") == 0
+        and channel.get("parent_id") in backup_category_ids
+        and channel.get("name", "").startswith("backup-")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda channel: int(channel["id"]))
+
+
 def resolve_channel():
-    global channel_id, channel_name
+    global channel_id, channel_name, guild_id
 
     if channel_id:
         print(f"Resolving Discord channel {channel_id}...", flush=True)
@@ -219,25 +241,94 @@ def resolve_channel():
             action=f"Resolving Discord channel {channel_id}",
         )
         channel_name = channel.get("name", channel_name)
+        guild_id = str(channel.get("guild_id", guild_id or "")).strip()
         return
 
-    print(f"Resolving Discord channel #{channel_name} in guild {guild_id}...", flush=True)
-    channels = request_json(
-        f"{api_base}/guilds/{urllib.parse.quote(guild_id)}/channels",
-        action=f"Listing channels for guild {guild_id}",
-    )
-    matches = [
-        channel
-        for channel in channels
-        if channel.get("type") == 0 and channel.get("name") == channel_name
-    ]
-    if not matches:
-        raise SystemExit(f"Could not find text channel named {channel_name!r}.")
-    if len(matches) > 1:
-        print(f"Found {len(matches)} channels named {channel_name!r}; using the first one.", flush=True)
+    guilds = None
+    if not guild_id:
+        guilds = fetch_guilds()
+        if not guilds:
+            raise SystemExit("This bot is not currently in any guilds.")
 
-    channel_id = str(matches[0]["id"])
-    channel_name = matches[0].get("name", channel_name)
+    if channel_name:
+        if guild_id:
+            print(f"Resolving Discord channel #{channel_name} in guild {guild_id}...", flush=True)
+            channels = fetch_guild_channels(guild_id)
+            matches = [
+                channel
+                for channel in channels
+                if channel.get("type") == 0 and channel.get("name") == channel_name
+            ]
+            if not matches:
+                raise SystemExit(f"Could not find text channel named {channel_name!r}.")
+            if len(matches) > 1:
+                print(
+                    f"Found {len(matches)} channels named {channel_name!r}; using the newest one.",
+                    flush=True,
+                )
+            selected = max(matches, key=lambda channel: int(channel["id"]))
+            channel_id = str(selected["id"])
+            channel_name = selected.get("name", channel_name)
+            return
+
+        print(f"Resolving Discord channel #{channel_name} across all guilds...", flush=True)
+        matches = []
+        for guild in guilds:
+            current_guild_id = str(guild["id"])
+            channels = fetch_guild_channels(current_guild_id)
+            for channel in channels:
+                if channel.get("type") == 0 and channel.get("name") == channel_name:
+                    matches.append((guild, channel))
+        if not matches:
+            raise SystemExit(f"Could not find text channel named {channel_name!r} in any guild.")
+        selected_guild, selected_channel = max(matches, key=lambda item: int(item[1]["id"]))
+        guild_id = str(selected_guild["id"])
+        channel_id = str(selected_channel["id"])
+        channel_name = selected_channel.get("name", channel_name)
+        print(
+            f"Resolved #{channel_name} to guild {selected_guild['name']} ({guild_id}).",
+            flush=True,
+        )
+        return
+
+    if guild_id:
+        print(
+            f"Auto-detecting the newest backup channel in the Backups category for guild {guild_id}...",
+            flush=True,
+        )
+        channels = fetch_guild_channels(guild_id)
+        selected = latest_backup_channel_in_channels(channels)
+        if selected is None:
+            raise SystemExit(
+                f"Could not find any text channels starting with 'backup-' under a 'Backups' category in guild {guild_id}."
+            )
+        channel_id = str(selected["id"])
+        channel_name = selected.get("name", "")
+        print(f"Auto-detected backup channel #{channel_name} ({channel_id}).", flush=True)
+        return
+
+    print("Auto-detecting the newest backup channel across all guilds...", flush=True)
+    candidates = []
+    for guild in guilds:
+        current_guild_id = str(guild["id"])
+        channels = fetch_guild_channels(current_guild_id)
+        selected = latest_backup_channel_in_channels(channels)
+        if selected is not None:
+            candidates.append((guild, selected))
+
+    if not candidates:
+        raise SystemExit(
+            "Could not find any text channels starting with 'backup-' under a 'Backups' category in any guild."
+        )
+
+    selected_guild, selected_channel = max(candidates, key=lambda item: int(item[1]["id"]))
+    guild_id = str(selected_guild["id"])
+    channel_id = str(selected_channel["id"])
+    channel_name = selected_channel.get("name", "")
+    print(
+        f"Auto-detected backup channel #{channel_name} ({channel_id}) in guild {selected_guild['name']}.",
+        flush=True,
+    )
 
 
 resolve_channel()

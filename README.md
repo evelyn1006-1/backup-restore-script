@@ -82,6 +82,16 @@ export RESTORE_CHANNEL_NAME='backup-YYYYMMDD-HHMMSS'
 curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
 ```
 
+Or let it auto-detect the newest backup channel under a `Backups` category:
+
+```bash
+export DISCORD_TOKEN='...'
+export RESTORE_GUILD_ID='...'
+curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
+```
+
+If `RESTORE_GUILD_ID` and `GUILD_ID` are both omitted too, the bootstrap script scans all guilds the bot is in and picks the newest text channel whose parent category is named `Backups` and whose name starts with `backup-`.
+
 If `RESTORE_ARCHIVE_NAME` is not set, the bootstrap script scans the channel attachments and auto-detects a complete chunk set shaped like:
 
 ```text
