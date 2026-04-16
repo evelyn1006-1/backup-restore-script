@@ -16,12 +16,13 @@ import os
 import tarfile
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
 
 import aiohttp
 import discord
+from discord import app_commands
 from dotenv import load_dotenv
 
 
@@ -183,6 +184,13 @@ async def send_discord_file(
     return await with_discord_retries(f"upload {filename} to #{channel.name}", send_once)
 
 
+async def delete_discord_channel(channel: discord.abc.GuildChannel, *, reason: str) -> None:
+    await with_discord_retries(
+        f"delete channel #{channel.name}",
+        lambda: channel.delete(reason=reason),
+    )
+
+
 async def get_target_guild(client: discord.Client) -> discord.Guild:
     guild_id = getattr(client, "guild_id", None)
     if guild_id is not None:
@@ -324,6 +332,131 @@ def split_discord_message(message: str) -> list[str]:
     return chunks
 
 
+def summarize_channel_names(channels: list[discord.TextChannel], *, limit: int = 15) -> str:
+    names = [f"`#{channel.name}`" for channel in channels[:limit]]
+    if len(channels) > limit:
+        names.append(f"... and {len(channels) - limit} more")
+    return ", ".join(names) if names else "none"
+
+
+@app_commands.command(
+    name="purge_backups",
+    description="Delete backup channels in Backups older than the specified number of days.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.describe(
+    days="Delete channels older than this many days. Use 0 to delete all backup channels.",
+    dry_run="Preview which channels would be deleted without actually deleting them.",
+)
+async def purge_backups_command(
+    interaction: discord.Interaction,
+    days: app_commands.Range[int, 0, 3650],
+    dry_run: bool = False,
+) -> None:
+    member = interaction.user
+    permissions = getattr(member, "guild_permissions", None)
+    if permissions is None or not permissions.manage_channels:
+        await interaction.response.send_message(
+            "You need `Manage Channels` to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
+    if category is None:
+        await interaction.followup.send(
+            f"No `{CATEGORY_NAME}` category exists in this server.",
+            ephemeral=True,
+        )
+        return
+
+    cutoff = discord.utils.utcnow() - timedelta(days=days)
+    threshold_label = (
+        "all backup channels"
+        if days == 0
+        else f"backup channels older than {days} day(s)"
+    )
+    purge_candidates = sorted(
+        [
+            channel
+            for channel in guild.text_channels
+            if channel.category_id == category.id
+            and channel.name.startswith(f"{CHANNEL_PREFIX}-")
+            and channel.created_at <= cutoff
+        ],
+        key=lambda channel: channel.created_at,
+    )
+
+    if not purge_candidates:
+        await interaction.followup.send(
+            f"No {threshold_label} were found under `{CATEGORY_NAME}`.",
+            ephemeral=True,
+        )
+        return
+
+    if dry_run:
+        await interaction.followup.send(
+            "\n".join(
+                (
+                    "Dry run only; no channels were deleted.",
+                    f"Would delete {len(purge_candidates)} channel(s) from {threshold_label}.",
+                    f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+                    f"Targets: {summarize_channel_names(purge_candidates)}",
+                )
+            ),
+            ephemeral=True,
+        )
+        return
+
+    deleted_names = [channel.name for channel in purge_candidates]
+    reason = (
+        f"Purged by {interaction.user} ({interaction.user.id}) "
+        f"for being older than {days} day(s)"
+    )
+
+    for channel in purge_candidates:
+        await delete_discord_channel(channel, reason=reason)
+
+    timestamp = datetime.now().astimezone()
+    append_backup_log(
+        "\n".join(
+            (
+                "Backup channels purged",
+                f"Time: {timestamp.isoformat(timespec='seconds')}",
+                f"Requested by: {interaction.user} ({interaction.user.id})",
+                f"Threshold: {threshold_label}",
+                f"Days threshold: {days}",
+                f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+                f"Deleted channels: {len(deleted_names)}",
+                f"Deleted names: {', '.join(f'#{name}' for name in deleted_names)}",
+            )
+        )
+    )
+
+    await interaction.followup.send(
+        "\n".join(
+            (
+                f"Deleted {len(deleted_names)} channel(s) from {threshold_label}.",
+                f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+                f"Deleted: {', '.join(f'`#{name}`' for name in deleted_names[:15])}"
+                + (f", ... and {len(deleted_names) - 15} more" if len(deleted_names) > 15 else ""),
+            )
+        ),
+        ephemeral=True,
+    )
+
+
 async def handle_backup_signal(client: discord.Client) -> None:
     started_at = datetime.now().astimezone()
     monotonic_start = time.monotonic()
@@ -401,9 +534,19 @@ class BackupClient(discord.Client):
     def __init__(self, *, guild_id: int | None, **options: object) -> None:
         super().__init__(**options)
         self.guild_id = guild_id
+        self.tree = app_commands.CommandTree(self)
+        self.tree.add_command(purge_backups_command)
 
     async def setup_hook(self) -> None:
         self.signal_task = asyncio.create_task(signal_loop(self))
+        if self.guild_id is not None:
+            guild = discord.Object(id=self.guild_id)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            logger.info("Synced %s app command(s) to guild %s", len(synced), self.guild_id)
+        else:
+            synced = await self.tree.sync()
+            logger.info("Synced %s global app command(s)", len(synced))
 
     async def on_ready(self) -> None:
         guild_names = ", ".join(guild.name for guild in self.guilds) or "none"
