@@ -65,6 +65,31 @@ sudo journalctl -u backup-discord-bot.service -f
 
 ## Restore
 
+On a fresh machine, export a bot token that can read the backup channel, then run:
+
+```bash
+export DISCORD_TOKEN='...'
+curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
+```
+
+That downloads the verified default backup chunks from Discord, recombines them, checks the SHA256, and extracts the backup into:
+
+```bash
+~/restored-home-backup-20260415_203026
+```
+
+The bootstrap script needs only `sh`, `curl`, `python3`, and `tar`. It does not need `pip`, `requests`, `python-dotenv`, `backup.log`, or `GUILD_ID`.
+
+Useful overrides:
+
+```bash
+RESTORE_EXTRACT_DIR="$HOME/restored-backup" \
+RESTORE_OUTPUT_DIR="$HOME/discord-backup-restore" \
+curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
+```
+
+Set `RESTORE_OVERWRITE=1` to replace an existing extraction directory.
+
 If `backup.log` is present, the restore script can usually infer the latest channel, archive, size, chunk count, and SHA256:
 
 ```bash
