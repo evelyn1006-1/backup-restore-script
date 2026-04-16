@@ -101,7 +101,7 @@ expected_chunks = parse_int_env("RESTORE_EXPECTED_CHUNKS", expected_chunks_raw)
 expected_size = parse_int_env("RESTORE_EXPECTED_SIZE", expected_size_raw)
 
 
-def request_json(url, retries=6):
+def request_json(url, retries=6, *, action="Discord request"):
     delay = 10.0
     for attempt in range(1, retries + 1):
         request = urllib.request.Request(url, headers=headers)
@@ -110,10 +110,19 @@ def request_json(url, retries=6):
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read()
+            error_message = ""
+            error_code = None
+            payload = {}
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                error_message = payload.get("message", "")
+                error_code = payload.get("code")
+            except Exception:
+                pass
             retry_after = None
             if exc.code == 429:
                 try:
-                    retry_after = float(json.loads(body.decode("utf-8")).get("retry_after", delay))
+                    retry_after = float(payload.get("retry_after", delay))
                 except Exception:
                     retry_after = delay
             if exc.code == 429 or exc.code >= 500:
@@ -124,7 +133,25 @@ def request_json(url, retries=6):
                 time.sleep(sleep_for)
                 delay = min(delay * 2, 120.0)
                 continue
-            raise
+            if exc.code == 401:
+                raise SystemExit(
+                    f"{action} failed: DISCORD_TOKEN was rejected by Discord (HTTP 401)."
+                )
+            if exc.code == 403:
+                raise SystemExit(
+                    f"{action} failed: bot does not have access "
+                    f"(HTTP 403, Discord code {error_code or 'unknown'}: {error_message or 'Forbidden'})."
+                )
+            if exc.code == 404:
+                raise SystemExit(
+                    f"{action} failed: resource was not found "
+                    f"(HTTP 404, Discord code {error_code or 'unknown'}: {error_message or 'Not Found'})."
+                )
+            raise SystemExit(
+                f"{action} failed: HTTP {exc.code}"
+                + (f" ({error_message})" if error_message else "")
+                + "."
+            )
         except (TimeoutError, OSError) as exc:
             if attempt == retries:
                 raise
@@ -187,12 +214,18 @@ def resolve_channel():
 
     if channel_id:
         print(f"Resolving Discord channel {channel_id}...", flush=True)
-        channel = request_json(f"{api_base}/channels/{urllib.parse.quote(channel_id)}")
+        channel = request_json(
+            f"{api_base}/channels/{urllib.parse.quote(channel_id)}",
+            action=f"Resolving Discord channel {channel_id}",
+        )
         channel_name = channel.get("name", channel_name)
         return
 
     print(f"Resolving Discord channel #{channel_name} in guild {guild_id}...", flush=True)
-    channels = request_json(f"{api_base}/guilds/{urllib.parse.quote(guild_id)}/channels")
+    channels = request_json(
+        f"{api_base}/guilds/{urllib.parse.quote(guild_id)}/channels",
+        action=f"Listing channels for guild {guild_id}",
+    )
     matches = [
         channel
         for channel in channels
@@ -215,7 +248,7 @@ while True:
     url = f"{api_base}/channels/{urllib.parse.quote(channel_id)}/messages?limit=100"
     if before:
         url = f"{url}&before={urllib.parse.quote(before)}"
-    page = request_json(url)
+    page = request_json(url, action=f"Fetching messages from Discord channel {channel_id}")
     if not page:
         break
     messages.extend(page)
