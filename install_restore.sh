@@ -1,25 +1,40 @@
 #!/bin/sh
-# Restore the verified Discord backup with one curl-piped shell command.
+# Restore a Discord backup with one curl-piped shell command.
 #
-# Usage on a fresh machine:
-#   export DISCORD_TOKEN='your-bot-token'
-#   curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
+# Required:
+#   DISCORD_TOKEN
+#   and either RESTORE_CHANNEL_ID
+#   or RESTORE_GUILD_ID/GUILD_ID plus RESTORE_CHANNEL_NAME
+#
+# Optional:
+#   RESTORE_ARCHIVE_NAME
+#   RESTORE_EXPECTED_CHUNKS
+#   RESTORE_EXPECTED_SIZE
+#   RESTORE_EXPECTED_SHA256
+#   RESTORE_OUTPUT_DIR
+#   RESTORE_EXTRACT_DIR
+#   RESTORE_OVERWRITE=1
 
 set -eu
 
-ARCHIVE_NAME="${RESTORE_ARCHIVE_NAME:-home_backup_20260415_203026.tar.gz}"
-CHANNEL_ID="${RESTORE_CHANNEL_ID:-1494148852951814254}"
-EXPECTED_CHUNKS="${RESTORE_EXPECTED_CHUNKS:-51}"
-EXPECTED_SIZE="${RESTORE_EXPECTED_SIZE:-509126153}"
-EXPECTED_SHA256="${RESTORE_EXPECTED_SHA256:-bad264641f396e58924c0f12ac7e717593316885d9268b837db9f576c44c70f8}"
 API_BASE="${RESTORE_API_BASE:-https://discord.com/api/v10}"
 OUTPUT_DIR="${RESTORE_OUTPUT_DIR:-$HOME/discord-backup-restore}"
-EXTRACT_DIR="${RESTORE_EXTRACT_DIR:-$HOME/restored-home-backup-20260415_203026}"
 PYTHON="${PYTHON:-python3}"
 
 if [ -z "${DISCORD_TOKEN:-}" ]; then
     echo "DISCORD_TOKEN is not set. Run: export DISCORD_TOKEN='your-bot-token'" >&2
     exit 1
+fi
+
+if [ -z "${RESTORE_CHANNEL_ID:-}" ]; then
+    if [ -z "${RESTORE_CHANNEL_NAME:-}" ]; then
+        echo "Set RESTORE_CHANNEL_ID, or set RESTORE_CHANNEL_NAME with RESTORE_GUILD_ID/GUILD_ID." >&2
+        exit 1
+    fi
+    if [ -z "${RESTORE_GUILD_ID:-${GUILD_ID:-}}" ]; then
+        echo "Set RESTORE_GUILD_ID or GUILD_ID when using RESTORE_CHANNEL_NAME." >&2
+        exit 1
+    fi
 fi
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
@@ -32,53 +47,58 @@ if ! command -v tar >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ -e "$EXTRACT_DIR" ]; then
-    if [ "${RESTORE_OVERWRITE:-0}" = "1" ]; then
-        rm -rf "$EXTRACT_DIR"
-    else
-        echo "Extraction directory already exists: $EXTRACT_DIR" >&2
-        echo "Set RESTORE_OVERWRITE=1 to replace it, or RESTORE_EXTRACT_DIR=/some/new/path." >&2
-        exit 1
-    fi
-fi
-
 mkdir -p "$OUTPUT_DIR"
-
-export ARCHIVE_NAME
-export CHANNEL_ID
-export EXPECTED_CHUNKS
-export EXPECTED_SIZE
-export EXPECTED_SHA256
-export API_BASE
-export OUTPUT_DIR
+export API_BASE OUTPUT_DIR
 
 "$PYTHON" <<'PY'
 import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
-archive_name = os.environ["ARCHIVE_NAME"]
-channel_id = os.environ["CHANNEL_ID"]
-expected_chunks = int(os.environ["EXPECTED_CHUNKS"])
-expected_size = int(os.environ["EXPECTED_SIZE"])
-expected_sha256 = os.environ["EXPECTED_SHA256"]
+token = os.environ["DISCORD_TOKEN"]
 api_base = os.environ["API_BASE"].rstrip("/")
 output_dir = Path(os.environ["OUTPUT_DIR"]).expanduser()
-chunk_dir = output_dir / f"{archive_name}.chunks"
-restored_path = output_dir / archive_name
-token = os.environ["DISCORD_TOKEN"]
+channel_id = os.environ.get("RESTORE_CHANNEL_ID", "").strip()
+channel_name = os.environ.get("RESTORE_CHANNEL_NAME", "").strip().lstrip("#")
+guild_id = (
+    os.environ.get("RESTORE_GUILD_ID")
+    or os.environ.get("GUILD_ID")
+    or ""
+).strip()
+archive_name = os.environ.get("RESTORE_ARCHIVE_NAME", "").strip()
+expected_chunks_raw = os.environ.get("RESTORE_EXPECTED_CHUNKS", "").strip()
+expected_size_raw = os.environ.get("RESTORE_EXPECTED_SIZE", "").strip()
+expected_sha256 = os.environ.get("RESTORE_EXPECTED_SHA256", "").strip().lower()
+extract_dir_raw = os.environ.get("RESTORE_EXTRACT_DIR", "").strip()
+overwrite = os.environ.get("RESTORE_OVERWRITE", "") == "1"
 
 headers = {
     "Authorization": f"Bot {token}",
     "User-Agent": "backup-restore-script/1.0",
 }
+
+
+def parse_int_env(name, raw):
+    if not raw:
+        return None
+    try:
+        return int(raw.replace(",", ""))
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}.")
+
+
+expected_chunks = parse_int_env("RESTORE_EXPECTED_CHUNKS", expected_chunks_raw)
+expected_size = parse_int_env("RESTORE_EXPECTED_SIZE", expected_size_raw)
 
 
 def request_json(url, retries=6):
@@ -89,8 +109,8 @@ def request_json(url, retries=6):
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            retry_after = None
             body = exc.read()
+            retry_after = None
             if exc.code == 429:
                 try:
                     retry_after = float(json.loads(body.decode("utf-8")).get("retry_after", delay))
@@ -162,13 +182,74 @@ def download(url, destination, expected_bytes, retries=6):
             delay = min(delay * 2, 120.0)
 
 
+def infer_archive_name(name):
+    match = re.fullmatch(r"backup-(\d{8})-(\d{6})(?:-\d+)?", name)
+    if not match:
+        raise SystemExit(
+            "RESTORE_ARCHIVE_NAME is not set and the channel name does not look like "
+            "backup-YYYYMMDD-HHMMSS."
+        )
+    return f"home_backup_{match.group(1)}_{match.group(2)}.tar.gz"
+
+
+def resolve_channel():
+    global channel_id, channel_name
+
+    if channel_id:
+        print(f"Resolving Discord channel {channel_id}...", flush=True)
+        channel = request_json(f"{api_base}/channels/{urllib.parse.quote(channel_id)}")
+        channel_name = channel.get("name", channel_name)
+        return
+
+    print(f"Resolving Discord channel #{channel_name} in guild {guild_id}...", flush=True)
+    channels = request_json(f"{api_base}/guilds/{urllib.parse.quote(guild_id)}/channels")
+    matches = [
+        channel
+        for channel in channels
+        if channel.get("type") == 0 and channel.get("name") == channel_name
+    ]
+    if not matches:
+        raise SystemExit(f"Could not find text channel named {channel_name!r}.")
+    if len(matches) > 1:
+        print(f"Found {len(matches)} channels named {channel_name!r}; using the first one.", flush=True)
+
+    channel_id = str(matches[0]["id"])
+    channel_name = matches[0].get("name", channel_name)
+
+
+resolve_channel()
+if not archive_name:
+    archive_name = infer_archive_name(channel_name)
+    print(f"Inferred archive name from channel name: {archive_name}", flush=True)
+
+chunk_dir = output_dir / f"{archive_name}.chunks"
+restored_path = output_dir / archive_name
+if extract_dir_raw:
+    extract_dir = Path(extract_dir_raw).expanduser()
+else:
+    archive_stem = archive_name
+    for suffix in (".tar.gz", ".tgz", ".tar"):
+        if archive_stem.endswith(suffix):
+            archive_stem = archive_stem[: -len(suffix)]
+            break
+    extract_dir = Path.home() / f"restored-{archive_stem}"
+
+if extract_dir.exists():
+    if overwrite:
+        shutil.rmtree(extract_dir)
+    else:
+        raise SystemExit(
+            f"Extraction directory already exists: {extract_dir}\n"
+            "Set RESTORE_OVERWRITE=1 to replace it, or RESTORE_EXTRACT_DIR to choose a new path."
+        )
+
 print(f"Fetching messages from Discord channel {channel_id}...", flush=True)
 messages = []
 before = None
 while True:
-    url = f"{api_base}/channels/{channel_id}/messages?limit=100"
+    url = f"{api_base}/channels/{urllib.parse.quote(channel_id)}/messages?limit=100"
     if before:
-        url = f"{url}&before={before}"
+        url = f"{url}&before={urllib.parse.quote(before)}"
     page = request_json(url)
     if not page:
         break
@@ -201,6 +282,23 @@ for message in messages:
         )
 
 chunks = [chunks_by_index[index] for index in sorted(chunks_by_index)]
+if not chunks:
+    raise SystemExit(
+        f"No chunk attachments found for archive {archive_name!r} in #{channel_name or channel_id}."
+    )
+
+totals = {chunk["total"] for chunk in chunks}
+if len(totals) != 1:
+    raise SystemExit(f"Chunk filenames disagree on total chunk count: {sorted(totals)}.")
+
+inferred_chunks = totals.pop()
+if expected_chunks is None:
+    expected_chunks = inferred_chunks
+elif expected_chunks != inferred_chunks:
+    raise SystemExit(
+        f"Chunk filenames say {inferred_chunks} chunks, RESTORE_EXPECTED_CHUNKS={expected_chunks}."
+    )
+
 if len(chunks) != expected_chunks:
     raise SystemExit(f"Found {len(chunks)} chunks, expected {expected_chunks}.")
 
@@ -208,9 +306,6 @@ expected_indices = list(range(1, expected_chunks + 1))
 actual_indices = [chunk["index"] for chunk in chunks]
 if actual_indices != expected_indices:
     raise SystemExit(f"Chunk index mismatch: got {actual_indices}, expected {expected_indices}.")
-
-if any(chunk["total"] != expected_chunks for chunk in chunks):
-    raise SystemExit("At least one chunk filename has the wrong total chunk count.")
 
 chunk_dir.mkdir(parents=True, exist_ok=True)
 print(f"Downloading chunks into {chunk_dir}...", flush=True)
@@ -244,15 +339,18 @@ actual_sha256 = digest.hexdigest()
 print(f"restored_size={bytes_written}", flush=True)
 print(f"restored_sha256={actual_sha256}", flush=True)
 
-if bytes_written != expected_size:
+if expected_size is not None and bytes_written != expected_size:
     raise SystemExit(f"Restored size mismatch: got {bytes_written}, expected {expected_size}.")
-if actual_sha256 != expected_sha256:
+if expected_sha256 and actual_sha256 != expected_sha256:
     raise SystemExit(f"SHA256 mismatch: got {actual_sha256}, expected {expected_sha256}.")
 
-print("archive_verified=True", flush=True)
-PY
+if expected_size is not None or expected_sha256:
+    print("archive_verified=True", flush=True)
+else:
+    print("archive_verified=False; set RESTORE_EXPECTED_SIZE and/or RESTORE_EXPECTED_SHA256 to verify.", flush=True)
 
-mkdir -p "$EXTRACT_DIR"
-echo "Extracting $OUTPUT_DIR/$ARCHIVE_NAME into $EXTRACT_DIR..."
-tar -xzf "$OUTPUT_DIR/$ARCHIVE_NAME" -C "$EXTRACT_DIR"
-echo "Restored backup directory: $EXTRACT_DIR"
+extract_dir.mkdir(parents=True)
+print(f"Extracting {restored_path} into {extract_dir}...", flush=True)
+subprocess.run(["tar", "-xzf", str(restored_path), "-C", str(extract_dir)], check=True)
+print(f"Restored backup directory: {extract_dir}", flush=True)
+PY

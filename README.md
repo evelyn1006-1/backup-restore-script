@@ -65,20 +65,47 @@ sudo journalctl -u backup-discord-bot.service -f
 
 ## Restore
 
-On a fresh machine, export a bot token that can read the backup channel, then run:
+On a fresh machine, export a bot token and the Discord backup target, then run:
 
 ```bash
 export DISCORD_TOKEN='...'
+export RESTORE_CHANNEL_ID='...'
+export RESTORE_ARCHIVE_NAME='home_backup_YYYYMMDD_HHMMSS.tar.gz'
 curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
 ```
 
-That downloads the verified default backup chunks from Discord, recombines them, checks the SHA256, and extracts the backup into:
+You can also use a guild ID and channel name instead of a channel ID:
 
 ```bash
-~/restored-home-backup-20260415_203026
+export DISCORD_TOKEN='...'
+export RESTORE_GUILD_ID='...'
+export RESTORE_CHANNEL_NAME='backup-YYYYMMDD-HHMMSS'
+curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
 ```
 
-The bootstrap script needs only `sh`, `curl`, `python3`, and `tar`. It does not need `pip`, `requests`, `python-dotenv`, `backup.log`, or `GUILD_ID`.
+If `RESTORE_ARCHIVE_NAME` is not set, the bootstrap script infers it from a channel name shaped like `backup-YYYYMMDD-HHMMSS`:
+
+```text
+backup-YYYYMMDD-HHMMSS -> home_backup_YYYYMMDD_HHMMSS.tar.gz
+```
+
+If the channel timestamp differs from the archive timestamp, set `RESTORE_ARCHIVE_NAME` explicitly.
+
+For integrity checks, pass any known values:
+
+```bash
+export RESTORE_EXPECTED_CHUNKS='...'
+export RESTORE_EXPECTED_SIZE='...'
+export RESTORE_EXPECTED_SHA256='...'
+```
+
+The script downloads the chunks from Discord, recombines them, checks any expected values you supplied, and extracts the backup into a directory in your home folder. The default extraction path is derived from the archive name, like:
+
+```bash
+~/restored-home_backup_YYYYMMDD_HHMMSS
+```
+
+The bootstrap script needs only `sh`, `curl`, `python3`, and `tar`. It does not need `pip`, `requests`, `python-dotenv`, `backup.log`, or a local copy of this repo.
 
 Useful overrides:
 
