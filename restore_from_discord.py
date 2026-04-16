@@ -693,16 +693,20 @@ def backup_restore_filter(member: tarfile.TarInfo, destination: str) -> tarfile.
     return member
 
 
+def default_extract_dir_for(archive_path: Path) -> Path:
+    archive_stem = archive_path.name
+    for suffix in (".tar.gz", ".tgz", ".tar"):
+        if archive_stem.endswith(suffix):
+            archive_stem = archive_stem[: -len(suffix)]
+            break
+    return Path.home() / f"restored-{archive_stem}"
+
+
 def extract_archive(archive_path: Path, *, output_dir: Path, extract_dir: Path | None, overwrite: bool) -> Path:
     assert_safe_tar_members(archive_path)
 
     if extract_dir is None:
-        archive_stem = archive_path.name
-        for suffix in (".tar.gz", ".tgz", ".tar"):
-            if archive_stem.endswith(suffix):
-                archive_stem = archive_stem[: -len(suffix)]
-                break
-        extract_dir = Path.home() / f"restored-{archive_stem}"
+        extract_dir = default_extract_dir_for(archive_path)
         if extract_dir.exists():
             if not overwrite:
                 raise SystemExit(f"Extraction directory already exists: {extract_dir}")
@@ -854,10 +858,11 @@ def main() -> int:
             overwrite=args.overwrite,
             request_options=request_options,
         )
+        final_extract_dir = args.extract_dir or default_extract_dir_for(restored_path)
         extract_dir = extract_archive(
             basis_restored_path,
             output_dir=args.output_dir,
-            extract_dir=args.extract_dir,
+            extract_dir=final_extract_dir,
             overwrite=args.overwrite,
         )
         extract_into_existing_directory(restored_path, extract_dir)
