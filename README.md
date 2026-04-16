@@ -96,7 +96,15 @@ If the channel contains multiple complete archives, set `RESTORE_ARCHIVE_NAME` e
 export RESTORE_ARCHIVE_NAME='home_backup_YYYYMMDD_HHMMSS.tar.gz'
 ```
 
-For integrity checks, pass any known values:
+For integrity checks, the bootstrap script first looks for the bot's summary message in the same Discord channel and auto-detects:
+
+```text
+Size: ... (... bytes)
+Chunks: ...
+SHA256: ...
+```
+
+You can override those detected values with env vars:
 
 ```bash
 export RESTORE_EXPECTED_CHUNKS='...'
@@ -104,7 +112,7 @@ export RESTORE_EXPECTED_SIZE='...'
 export RESTORE_EXPECTED_SHA256='...'
 ```
 
-The script downloads the chunks from Discord, recombines them, checks any expected values you supplied, and extracts the backup into a directory in your home folder. The default extraction path is derived from the archive name, like:
+The script downloads the chunks from Discord, recombines them, checks detected or supplied expected values, and extracts the backup into a directory in your home folder. The default extraction path is derived from the archive name, like:
 
 ```bash
 ~/restored-home_backup_YYYYMMDD_HHMMSS

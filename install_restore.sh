@@ -279,6 +279,37 @@ def complete_archive_candidates():
     return sorted(complete)
 
 
+def parse_summary_values(name):
+    summaries = []
+    archive_pattern = re.compile(r"^Archive:\s*(.+?)\s*$", re.MULTILINE)
+    size_pattern = re.compile(r"^Size:.*\(([\d,]+)\s+bytes\)\s*$", re.MULTILINE)
+    chunks_pattern = re.compile(r"^Chunks:\s*([\d,]+)\s*x\b", re.MULTILINE)
+    sha_pattern = re.compile(r"^SHA256:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
+
+    for message in messages:
+        content = message.get("content", "")
+        archive_match = archive_pattern.search(content)
+        if not archive_match or archive_match.group(1).strip() != name:
+            continue
+
+        summary = {}
+        size_match = size_pattern.search(content)
+        chunks_match = chunks_pattern.search(content)
+        sha_match = sha_pattern.search(content)
+
+        if size_match:
+            summary["size"] = int(size_match.group(1).replace(",", ""))
+        if chunks_match:
+            summary["chunks"] = int(chunks_match.group(1).replace(",", ""))
+        if sha_match:
+            summary["sha256"] = sha_match.group(1).lower()
+
+        if summary:
+            summaries.append(summary)
+
+    return summaries[0] if summaries else {}
+
+
 if not archive_name:
     candidates = complete_archive_candidates()
     if not candidates:
@@ -324,6 +355,21 @@ if not chunks:
     raise SystemExit(
         f"No chunk attachments found for archive {archive_name!r} in #{channel_name or channel_id}."
     )
+
+summary_values = parse_summary_values(archive_name)
+if summary_values:
+    discovered = []
+    if expected_chunks is None and "chunks" in summary_values:
+        expected_chunks = summary_values["chunks"]
+        discovered.append(f"chunks={expected_chunks}")
+    if expected_size is None and "size" in summary_values:
+        expected_size = summary_values["size"]
+        discovered.append(f"size={expected_size}")
+    if not expected_sha256 and "sha256" in summary_values:
+        expected_sha256 = summary_values["sha256"]
+        discovered.append(f"sha256={expected_sha256}")
+    if discovered:
+        print(f"Auto-detected expected values from summary: {', '.join(discovered)}", flush=True)
 
 totals = {chunk["total"] for chunk in chunks}
 if len(totals) != 1:
