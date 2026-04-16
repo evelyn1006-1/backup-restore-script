@@ -33,6 +33,10 @@ BACKUP_PATTERN = "home_backup_*.tar.gz"
 
 CATEGORY_NAME = "Backups"
 CHANNEL_PREFIX = "backup"
+RESTORE_BOOTSTRAP_URL = (
+    "https://raw.githubusercontent.com/"
+    "evelyn1006-1/backup-restore-script/main/install_restore.sh"
+)
 CHUNK_SIZE = 10_000_000
 CHUNK_LABEL = "10 MB"
 UPLOAD_DELAY_SECONDS = 1
@@ -380,7 +384,13 @@ def build_event_message(
 ) -> str:
     file_count = "unknown" if regular_files is None else f"{regular_files:,}"
     entry_count = "unknown" if total_entries is None else f"{total_entries:,}"
-    restore_command = f"cat '{archive.name}.part'* > '{archive.name}'"
+    restore_commands = (
+        "Restore bootstrap:",
+        "export DISCORD_TOKEN='your-bot-token'",
+        f"export RESTORE_CHANNEL_ID='{channel.id}'",
+        f"curl -fsSL {RESTORE_BOOTSTRAP_URL} | sh",
+    )
+    manual_restore_command = f"cat '{archive.name}.part'* > '{archive.name}'"
 
     return "\n".join(
         (
@@ -396,8 +406,9 @@ def build_event_message(
             f"Archive entries: {entry_count}",
             f"Chunks: {chunk_count:,} x up to {CHUNK_LABEL} ({CHUNK_SIZE:,} bytes)",
             f"SHA256: {archive_hash}",
-            f"Restore: {restore_command}",
-            "Verify: sha256sum the restored file and compare it with the SHA256 above.",
+            *restore_commands,
+            f"Manual recombine after downloading chunk files: {manual_restore_command}",
+            "Verify: sha256sum the restored archive and compare it with the SHA256 above.",
         )
     )
 
