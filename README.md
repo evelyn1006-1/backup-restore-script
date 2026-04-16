@@ -70,7 +70,6 @@ On a fresh machine, export a bot token and the Discord backup target, then run:
 ```bash
 export DISCORD_TOKEN='...'
 export RESTORE_CHANNEL_ID='...'
-export RESTORE_ARCHIVE_NAME='home_backup_YYYYMMDD_HHMMSS.tar.gz'
 curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
 ```
 
@@ -83,13 +82,19 @@ export RESTORE_CHANNEL_NAME='backup-YYYYMMDD-HHMMSS'
 curl -fsSL https://raw.githubusercontent.com/evelyn1006-1/backup-restore-script/main/install_restore.sh | sh
 ```
 
-If `RESTORE_ARCHIVE_NAME` is not set, the bootstrap script infers it from a channel name shaped like `backup-YYYYMMDD-HHMMSS`:
+If `RESTORE_ARCHIVE_NAME` is not set, the bootstrap script scans the channel attachments and auto-detects a complete chunk set shaped like:
 
 ```text
-backup-YYYYMMDD-HHMMSS -> home_backup_YYYYMMDD_HHMMSS.tar.gz
+some-archive-name.tar.gz.part01of51
+some-archive-name.tar.gz.part02of51
+...
 ```
 
-If the channel timestamp differs from the archive timestamp, set `RESTORE_ARCHIVE_NAME` explicitly.
+If the channel contains multiple complete archives, set `RESTORE_ARCHIVE_NAME` explicitly:
+
+```bash
+export RESTORE_ARCHIVE_NAME='home_backup_YYYYMMDD_HHMMSS.tar.gz'
+```
 
 For integrity checks, pass any known values:
 

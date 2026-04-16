@@ -182,16 +182,6 @@ def download(url, destination, expected_bytes, retries=6):
             delay = min(delay * 2, 120.0)
 
 
-def infer_archive_name(name):
-    match = re.fullmatch(r"backup-(\d{8})-(\d{6})(?:-\d+)?", name)
-    if not match:
-        raise SystemExit(
-            "RESTORE_ARCHIVE_NAME is not set and the channel name does not look like "
-            "backup-YYYYMMDD-HHMMSS."
-        )
-    return f"home_backup_{match.group(1)}_{match.group(2)}.tar.gz"
-
-
 def resolve_channel():
     global channel_id, channel_name
 
@@ -218,9 +208,95 @@ def resolve_channel():
 
 
 resolve_channel()
+print(f"Fetching messages from Discord channel {channel_id}...", flush=True)
+messages = []
+before = None
+while True:
+    url = f"{api_base}/channels/{urllib.parse.quote(channel_id)}/messages?limit=100"
+    if before:
+        url = f"{url}&before={urllib.parse.quote(before)}"
+    page = request_json(url)
+    if not page:
+        break
+    messages.extend(page)
+    before = page[-1]["id"]
+    if len(page) < 100:
+        break
+
+print(f"Fetched {len(messages)} messages.", flush=True)
+
+def collect_chunks_for_archive(name):
+    pattern = re.compile(rf"^{re.escape(name)}\.part(\d+)of(\d+)$")
+    chunks_by_index = {}
+    for message in messages:
+        for attachment in message.get("attachments", []):
+            filename = attachment.get("filename", "")
+            match = pattern.match(filename)
+            if not match:
+                continue
+            index = int(match.group(1))
+            total = int(match.group(2))
+            chunks_by_index.setdefault(
+                index,
+                {
+                    "index": index,
+                    "total": total,
+                    "filename": filename,
+                    "url": attachment["url"],
+                    "size": int(attachment["size"]),
+                },
+            )
+    return [chunks_by_index[index] for index in sorted(chunks_by_index)]
+
+
+def complete_archive_candidates():
+    pattern = re.compile(r"^(.+)\.part(\d+)of(\d+)$")
+    groups = {}
+    for message in messages:
+        for attachment in message.get("attachments", []):
+            filename = attachment.get("filename", "")
+            match = pattern.match(filename)
+            if not match:
+                continue
+            candidate_name = match.group(1)
+            index = int(match.group(2))
+            total = int(match.group(3))
+            if expected_chunks is not None and total != expected_chunks:
+                continue
+            group = groups.setdefault(candidate_name, {"total": total, "indices": set()})
+            group["indices"].add(index)
+            if group["total"] != total:
+                group["total"] = None
+
+    complete = []
+    for candidate_name, group in groups.items():
+        total = group["total"]
+        if total is None:
+            continue
+        indices = group["indices"]
+        if indices == set(range(1, total + 1)):
+            complete.append((candidate_name, total))
+    return sorted(complete)
+
+
 if not archive_name:
-    archive_name = infer_archive_name(channel_name)
-    print(f"Inferred archive name from channel name: {archive_name}", flush=True)
+    candidates = complete_archive_candidates()
+    if not candidates:
+        raise SystemExit(
+            "Could not auto-detect a complete backup archive from chunk attachments. "
+            "Set RESTORE_ARCHIVE_NAME explicitly."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(name for name, _total in candidates)
+        raise SystemExit(
+            "Multiple complete backup archives were found in this channel. "
+            f"Set RESTORE_ARCHIVE_NAME to one of: {names}"
+        )
+    archive_name, detected_chunks = candidates[0]
+    print(
+        f"Auto-detected archive from attachments: {archive_name} ({detected_chunks} chunks)",
+        flush=True,
+    )
 
 chunk_dir = output_dir / f"{archive_name}.chunks"
 restored_path = output_dir / archive_name
@@ -243,45 +319,7 @@ if extract_dir.exists():
             "Set RESTORE_OVERWRITE=1 to replace it, or RESTORE_EXTRACT_DIR to choose a new path."
         )
 
-print(f"Fetching messages from Discord channel {channel_id}...", flush=True)
-messages = []
-before = None
-while True:
-    url = f"{api_base}/channels/{urllib.parse.quote(channel_id)}/messages?limit=100"
-    if before:
-        url = f"{url}&before={urllib.parse.quote(before)}"
-    page = request_json(url)
-    if not page:
-        break
-    messages.extend(page)
-    before = page[-1]["id"]
-    if len(page) < 100:
-        break
-
-print(f"Fetched {len(messages)} messages.", flush=True)
-
-pattern = re.compile(rf"^{re.escape(archive_name)}\.part(\d+)of(\d+)$")
-chunks_by_index = {}
-for message in messages:
-    for attachment in message.get("attachments", []):
-        filename = attachment.get("filename", "")
-        match = pattern.match(filename)
-        if not match:
-            continue
-        index = int(match.group(1))
-        total = int(match.group(2))
-        chunks_by_index.setdefault(
-            index,
-            {
-                "index": index,
-                "total": total,
-                "filename": filename,
-                "url": attachment["url"],
-                "size": int(attachment["size"]),
-            },
-        )
-
-chunks = [chunks_by_index[index] for index in sorted(chunks_by_index)]
+chunks = collect_chunks_for_archive(archive_name)
 if not chunks:
     raise SystemExit(
         f"No chunk attachments found for archive {archive_name!r} in #{channel_name or channel_id}."
