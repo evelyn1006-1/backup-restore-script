@@ -114,6 +114,13 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def write_json_file(path: Path, payload: dict) -> None:
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def count_archive_files(path: Path) -> tuple[int | None, int | None]:
     regular_files = 0
     total_entries = 0
@@ -266,30 +273,21 @@ def upload_manifest_payload(
     payload = json.loads(json.dumps(manifest))
     payload["upload"] = upload_info
     if payload.get("basis") is not None:
-        payload["basis"].setdefault("channel_id", payload["basis"].get("channel_id"))
-        payload["basis"].setdefault("channel_name", payload["basis"].get("channel_name"))
+        payload["basis"].setdefault("channel_id", None)
+        payload["basis"].setdefault("channel_name", None)
     return payload
 
 
 def write_upload_manifest_file(manifest_payload: dict, destination: Path) -> None:
-    destination.write_text(
-        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_file(destination, manifest_payload)
 
 
 def persist_manifest_update(manifest_path: Path, manifest_payload: dict) -> None:
-    manifest_path.write_text(
-        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_file(manifest_path, manifest_payload)
     state_manifest_name = manifest_path.name.replace(".manifest.json", ".json")
     state_manifest_path = BACKUP_STATE_DIR / "manifests" / state_manifest_name
     state_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    state_manifest_path.write_text(
-        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_file(state_manifest_path, manifest_payload)
 
 
 def apply_backup_channel_write_denials(
@@ -440,7 +438,7 @@ async def create_backup_channel(
     return channel
 
 
-async def upload_archive_chunks(channel: discord.TextChannel, archive: Path) -> tuple[int, int]:
+async def upload_archive_chunks(channel: discord.TextChannel, archive: Path) -> int:
     archive_size = archive.stat().st_size
     total_chunks = max(1, math.ceil(archive_size / CHUNK_SIZE))
     width = len(str(total_chunks))
@@ -465,7 +463,7 @@ async def upload_archive_chunks(channel: discord.TextChannel, archive: Path) -> 
                 if index < total_chunks:
                     await asyncio.sleep(UPLOAD_DELAY_SECONDS)
 
-    return total_chunks, archive_size
+    return total_chunks
 
 
 def build_event_message(
@@ -539,20 +537,23 @@ def build_event_message(
 
 
 def split_discord_message(message: str) -> list[str]:
+    if not message:
+        return []
     if len(message) <= MAX_DISCORD_MESSAGE:
         return [message]
 
     chunks: list[str] = []
-    current = ""
-    for line in message.splitlines():
-        candidate = f"{current}\n{line}" if current else line
-        if len(candidate) > MAX_DISCORD_MESSAGE:
-            chunks.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
+    remaining = message
+    while len(remaining) > MAX_DISCORD_MESSAGE:
+        split_at = remaining.rfind("\n", 0, MAX_DISCORD_MESSAGE + 1)
+        if split_at <= 0:
+            split_at = MAX_DISCORD_MESSAGE
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+    if remaining:
+        chunks.append(remaining)
     return chunks
 
 
@@ -708,7 +709,7 @@ async def handle_backup_signal(client: discord.Client, signal_command: str) -> N
         f"Uploading {manifest.get('backup_type', 'full')} backup `{archive.name}` in {CHUNK_LABEL} chunks.",
     )
 
-    chunk_count, archive_size = await upload_archive_chunks(channel, archive)
+    chunk_count = await upload_archive_chunks(channel, archive)
     if deleted_paths_path is not None:
         await send_discord_file(
             channel,
