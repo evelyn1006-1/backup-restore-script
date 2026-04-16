@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import subprocess
-import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -186,6 +185,11 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def write_manifest_copies(payload: dict, *paths: Path) -> None:
+    for path in paths:
+        write_json(path, payload)
+
+
 def load_manifest(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -259,6 +263,25 @@ def latest_uploaded_diff_for_basis(basis_archive_name: str) -> dict | None:
     return max(candidates, key=manifest_created_at)
 
 
+def path_from_relative_label(label: str) -> Path:
+    return Path(label[2:] if label.startswith("./") else label)
+
+
+def stage_changed_entry(*, relative_label_path: str, entry: dict, stage_root: Path) -> None:
+    relative_path = path_from_relative_label(relative_label_path)
+    source_path = HOME_DIR / relative_path
+    target_path = stage_root / relative_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if entry["type"] == "dir":
+        target_path.mkdir(parents=True, exist_ok=True)
+    elif entry["type"] == "symlink":
+        target_path.unlink(missing_ok=True)
+        os.symlink(os.readlink(source_path), target_path)
+    elif entry["type"] == "file":
+        shutil.copy2(source_path, target_path)
+
+
 def create_full_backup(*, pigz_processes: int) -> dict:
     created_at = local_now()
     stem = f"home_backup_full_{timestamp_label(created_at)}"
@@ -300,8 +323,7 @@ def create_full_backup(*, pigz_processes: int) -> dict:
             "index_name": index_path.name,
         },
     }
-    write_json(manifest_path, manifest)
-    write_json(state_manifest_path, manifest)
+    write_manifest_copies(manifest, manifest_path, state_manifest_path)
     return {
         "mode_used": "full",
         "archive_path": str(archive_path),
@@ -337,19 +359,11 @@ def create_differential_backup(*, basis: BasisManifest, pigz_processes: int) -> 
         for relative_label_path in changed_paths:
             if relative_label_path == ".":
                 continue
-            relative_path = Path(relative_label_path[2:] if relative_label_path.startswith("./") else relative_label_path)
-            entry = current_index[relative_label_path]
-            source_path = HOME_DIR / relative_path
-            target_path = stage_root / relative_path
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if entry["type"] == "dir":
-                target_path.mkdir(parents=True, exist_ok=True)
-            elif entry["type"] == "symlink":
-                target_path.unlink(missing_ok=True)
-                os.symlink(os.readlink(source_path), target_path)
-            elif entry["type"] == "file":
-                shutil.copy2(source_path, target_path)
+            stage_changed_entry(
+                relative_label_path=relative_label_path,
+                entry=current_index[relative_label_path],
+                stage_root=stage_root,
+            )
 
         deleted_paths_path.write_text(
             "".join(f"{path}\n" for path in deleted_paths),
@@ -407,8 +421,7 @@ def create_differential_backup(*, basis: BasisManifest, pigz_processes: int) -> 
             "index_name": None,
         },
     }
-    write_json(manifest_path, manifest)
-    write_json(state_manifest_path, manifest)
+    write_manifest_copies(manifest, manifest_path, state_manifest_path)
     return {
         "mode_used": "differential",
         "archive_path": str(archive_path),
