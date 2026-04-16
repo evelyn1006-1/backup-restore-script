@@ -41,6 +41,8 @@ MAX_DISCORD_MESSAGE = 2000
 DISCORD_RETRY_ATTEMPTS = 6
 DISCORD_RETRY_INITIAL_SECONDS = 10
 DISCORD_RETRY_MAX_SECONDS = 300
+BACKUP_WARNING_DELETE_AFTER_SECONDS = 8
+BACKUP_WARNING_COOLDOWN_SECONDS = 30
 
 
 logging.basicConfig(
@@ -191,6 +193,88 @@ async def delete_discord_channel(channel: discord.abc.GuildChannel, *, reason: s
     )
 
 
+def apply_backup_channel_write_denials(
+    overwrite: discord.PermissionOverwrite,
+) -> discord.PermissionOverwrite:
+    overwrite.send_messages = False
+    overwrite.send_messages_in_threads = False
+    overwrite.create_public_threads = False
+    overwrite.create_private_threads = False
+    return overwrite
+
+
+async def set_backup_channel_write_protection(
+    target: discord.abc.GuildChannel, guild: discord.Guild
+) -> None:
+    overwrite = apply_backup_channel_write_denials(
+        target.overwrites_for(guild.default_role)
+    )
+    await with_discord_retries(
+        f"set backup write protection on {target.name}",
+        lambda: target.set_permissions(
+            guild.default_role,
+            overwrite=overwrite,
+            reason="Keep backup channels read-only for restore safety",
+        ),
+    )
+
+
+async def ensure_backup_write_protection(
+    guild: discord.Guild, category: discord.CategoryChannel | None = None
+) -> discord.CategoryChannel | None:
+    category = category or discord.utils.get(guild.categories, name=CATEGORY_NAME)
+    if category is None:
+        return None
+
+    await set_backup_channel_write_protection(category, guild)
+    for channel in guild.text_channels:
+        if channel.category_id == category.id and channel.name.startswith(f"{CHANNEL_PREFIX}-"):
+            await set_backup_channel_write_protection(channel, guild)
+
+    return category
+
+
+def is_backup_text_channel(channel: discord.abc.GuildChannel | None) -> bool:
+    return (
+        isinstance(channel, discord.TextChannel)
+        and channel.category is not None
+        and channel.category.name == CATEGORY_NAME
+        and channel.name.startswith(f"{CHANNEL_PREFIX}-")
+    )
+
+
+def build_backup_channel_warning_embed(channel: discord.TextChannel) -> discord.Embed:
+    embed = discord.Embed(
+        title="Backup Channel Warning",
+        description=(
+            "This channel is reserved for backup archive data. Messages here may be "
+            "lost, ignored, or interfere with restore workflows."
+        ),
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Please Use", value="Post in a normal chat channel instead.", inline=False)
+    embed.add_field(name="Channel", value=f"`#{channel.name}`", inline=False)
+    return embed
+
+
+async def send_short_lived_backup_warning(message: discord.Message) -> None:
+    channel = message.channel
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    embed = build_backup_channel_warning_embed(channel)
+    await with_discord_retries(
+        f"warn user {message.author} in #{channel.name}",
+        lambda: message.reply(
+            embed=embed,
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+            delete_after=BACKUP_WARNING_DELETE_AFTER_SECONDS,
+        ),
+    )
+
+
 async def get_target_guild(client: discord.Client) -> discord.Guild:
     guild_id = getattr(client, "guild_id", None)
     if guild_id is not None:
@@ -217,7 +301,9 @@ async def get_or_create_backups_category(guild: discord.Guild) -> discord.Catego
             CATEGORY_NAME, reason="Create backup archive category"
         )
 
-    return await with_discord_retries("get or create Backups category", get_or_create)
+    category = await with_discord_retries("get or create Backups category", get_or_create)
+    await set_backup_channel_write_protection(category, guild)
+    return category
 
 
 async def create_backup_channel(
@@ -246,7 +332,9 @@ async def create_backup_channel(
             reason="Upload triggered by signal.txt",
         )
 
-    return await with_discord_retries(f"create backup channel #{channel_name}", create_channel)
+    channel = await with_discord_retries(f"create backup channel #{channel_name}", create_channel)
+    await set_backup_channel_write_protection(channel, guild)
+    return channel
 
 
 async def upload_archive_chunks(channel: discord.TextChannel, archive: Path) -> tuple[int, int]:
@@ -536,6 +624,24 @@ class BackupClient(discord.Client):
         self.guild_id = guild_id
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(purge_backups_command)
+        self.backup_warning_times: dict[tuple[int, int], float] = {}
+
+    def should_send_backup_warning(self, *, user_id: int, channel_id: int) -> bool:
+        now = time.monotonic()
+        cutoff = now - BACKUP_WARNING_COOLDOWN_SECONDS
+        stale_keys = [
+            key for key, warned_at in self.backup_warning_times.items() if warned_at < cutoff
+        ]
+        for key in stale_keys:
+            del self.backup_warning_times[key]
+
+        key = (user_id, channel_id)
+        warned_at = self.backup_warning_times.get(key)
+        if warned_at is not None and warned_at >= cutoff:
+            return False
+
+        self.backup_warning_times[key] = now
+        return True
 
     async def setup_hook(self) -> None:
         self.signal_task = asyncio.create_task(signal_loop(self))
@@ -551,6 +657,31 @@ class BackupClient(discord.Client):
     async def on_ready(self) -> None:
         guild_names = ", ".join(guild.name for guild in self.guilds) or "none"
         logger.info("Logged in as %s; connected guilds: %s", self.user, guild_names)
+
+        try:
+            guild = await get_target_guild(self)
+            await ensure_backup_write_protection(guild)
+        except Exception:
+            logger.exception("Failed to enforce backup channel write protection")
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or message.guild is None:
+            return
+        if not is_backup_text_channel(message.channel):
+            return
+        if not self.should_send_backup_warning(
+            user_id=message.author.id, channel_id=message.channel.id
+        ):
+            return
+
+        try:
+            await send_short_lived_backup_warning(message)
+        except Exception:
+            logger.exception(
+                "Failed to warn %s about posting in backup channel #%s",
+                message.author,
+                getattr(message.channel, "name", "unknown"),
+            )
 
 
 def main() -> None:
