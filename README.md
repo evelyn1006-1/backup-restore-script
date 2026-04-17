@@ -4,7 +4,7 @@ Small Discord-backed home-directory backup system.
 
 It has three main pieces:
 
-- `backup_home.sh` creates a timestamped `home_backup_YYYYMMDD_HHMMSS.tar.gz`.
+- `backup_home.sh` creates a full or differential backup artifact under `artifacts/`.
 - `app.py` watches `signal.txt`; when nonempty, it clears the signal, creates a Discord channel under `Backups`, uploads the newest archive in 10 MB chunks, and records a summary.
 - `restore_from_discord.py` uses Discord's REST API to download chunk attachments, recombine them, verify the restored archive, and optionally extract it.
 
@@ -39,7 +39,7 @@ Run:
 ./backup_home.sh
 ```
 
-The script is configured for `/home/evelyn` and `/home/evelyn/backups`; edit the constants at the top if deploying elsewhere.
+The script is configured for `/home/evelyn`, `/home/evelyn/backups`, and `/home/evelyn/backups/artifacts`; edit the constants at the top if deploying elsewhere.
 
 To trigger a Discord upload after a backup exists:
 
