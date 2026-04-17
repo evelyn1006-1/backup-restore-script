@@ -3,8 +3,9 @@
 
 set -euo pipefail
 
-LOGFILE="/home/evelyn/backup.log"
+LOGFILE="/home/evelyn/backups/backup.log"
 BACKUP_DIR="/home/evelyn/backups"
+ARTIFACT_DIR="${BACKUP_DIR}/artifacts"
 STATE_DIR="${BACKUP_DIR}/state"
 RESULT_FILE="${STATE_DIR}/last_result.json"
 HELPER="${BACKUP_DIR}/create_backup.py"
@@ -12,7 +13,7 @@ RETENTION_DAYS=7
 PIGZ_PROCESSES=3
 MODE="${1:-full}"
 
-mkdir -p "$BACKUP_DIR" "$STATE_DIR" "$(dirname "$LOGFILE")"
+mkdir -p "$BACKUP_DIR" "$ARTIFACT_DIR" "$STATE_DIR" "$(dirname "$LOGFILE")"
 
 if ! command -v pigz >/dev/null 2>&1; then
     echo "pigz is required for parallel gzip compression" >&2
@@ -83,7 +84,7 @@ fi
 log "Archive created: ${ARCHIVE_SIZE}"
 
 log "Cleaning up local backups older than ${RETENTION_DAYS} days"
-find "$BACKUP_DIR" -maxdepth 1 \
+find "$ARTIFACT_DIR" -maxdepth 1 \
     \( -name "home_backup_*.tar.gz" -o -name "home_backup_*.manifest.json" -o -name "home_backup_*.deleted.txt" \) \
     -mtime +${RETENTION_DAYS} -delete 2>&1 | tee -a "$LOGFILE"
 find "$STATE_DIR" \( -name "*.json" -o -name "*.txt" \) -mtime +${RETENTION_DAYS} -delete 2>&1 | tee -a "$LOGFILE"

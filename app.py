@@ -3,7 +3,8 @@
 
 Watches signal.txt. When the file contains any bytes, clears it, creates a
 timestamped Discord channel under the Backups category, and uploads the newest
-home_backup_*.tar.gz archive in restore-friendly chunks.
+home_backup_*.tar.gz archive from the local artifacts directory in
+restore-friendly chunks.
 """
 
 from __future__ import annotations
@@ -115,6 +116,7 @@ def load_json(path: Path) -> dict:
 
 
 def write_json_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

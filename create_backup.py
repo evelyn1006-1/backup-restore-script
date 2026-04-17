@@ -17,19 +17,27 @@ from stat import S_IMODE
 
 
 BASE_DIR = Path(__file__).resolve().parent
-BACKUP_DIR = BASE_DIR
+BACKUP_ROOT_DIR = BASE_DIR
+ARTIFACTS_DIR = BACKUP_ROOT_DIR / "artifacts"
 HOME_DIR = Path("/home/evelyn")
-STATE_DIR = BACKUP_DIR / "state"
+STATE_DIR = BACKUP_ROOT_DIR / "state"
 INDEX_DIR = STATE_DIR / "indices"
 MANIFEST_DIR = STATE_DIR / "manifests"
 
 EXCLUDE_PREFIXES = (
     ".cache",
-    ".local",
     ".local/share/Trash",
-    "backups",
-    "logs",
-    ".config/rclone",
+    ".local/share/code-server/extensions",
+    ".local/share/code-server/logs",
+    ".local/share/code-server/CachedProfilesData",
+    ".local/share/code-server/CachedExtensionVSIXs",
+    ".local/share/code-server/coder-logs",
+    ".local/share/code-server/code-server-ipc.sock",
+    ".local/share/code-server/heartbeat",
+    ".local/share/claude/versions",
+    ".local/state/claude/locks",
+    "backups/artifacts",
+    "backups/__pycache__",
     ".gunicorn",
     "bootstrap",
     ".rustup",
@@ -45,7 +53,7 @@ class BasisManifest:
 
 def parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(
-        description="Create a full or differential backup artifact in /home/evelyn/backups.",
+        description="Create a full or differential backup artifact in /home/evelyn/backups/artifacts.",
     )
     arg_parser.add_argument(
         "--mode",
@@ -199,7 +207,7 @@ def manifest_created_at(manifest: dict) -> datetime:
 
 
 def manifest_path_for(stem: str) -> Path:
-    return BACKUP_DIR / f"{stem}.manifest.json"
+    return ARTIFACTS_DIR / f"{stem}.manifest.json"
 
 
 def index_path_for(stem: str) -> Path:
@@ -207,7 +215,11 @@ def index_path_for(stem: str) -> Path:
 
 
 def deleted_paths_path_for(stem: str) -> Path:
-    return BACKUP_DIR / f"{stem}.deleted.txt"
+    return ARTIFACTS_DIR / f"{stem}.deleted.txt"
+
+
+def archive_path_for(archive_name: str) -> Path:
+    return ARTIFACTS_DIR / archive_name
 
 
 def list_known_manifests() -> list[BasisManifest]:
@@ -286,7 +298,7 @@ def create_full_backup(*, pigz_processes: int) -> dict:
     created_at = local_now()
     stem = f"home_backup_full_{timestamp_label(created_at)}"
     archive_name = f"{stem}.tar.gz"
-    archive_path = BACKUP_DIR / archive_name
+    archive_path = archive_path_for(archive_name)
     manifest_path = manifest_path_for(stem)
     state_manifest_path = MANIFEST_DIR / f"{stem}.json"
     index_path = index_path_for(stem)
@@ -336,7 +348,7 @@ def create_differential_backup(*, basis: BasisManifest, pigz_processes: int) -> 
     created_at = local_now()
     stem = f"home_backup_diff_{timestamp_label(created_at)}"
     archive_name = f"{stem}.tar.gz"
-    archive_path = BACKUP_DIR / archive_name
+    archive_path = archive_path_for(archive_name)
     manifest_path = manifest_path_for(stem)
     state_manifest_path = MANIFEST_DIR / f"{stem}.json"
     deleted_paths_path = deleted_paths_path_for(stem)
@@ -436,6 +448,7 @@ def main() -> int:
     if shutil.which("pigz") is None:
         raise SystemExit("pigz is required for backup creation.")
 
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
