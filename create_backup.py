@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import tempfile
@@ -23,6 +24,7 @@ HOME_DIR = Path("/home/evelyn")
 STATE_DIR = BACKUP_ROOT_DIR / "state"
 INDEX_DIR = STATE_DIR / "indices"
 MANIFEST_DIR = STATE_DIR / "manifests"
+OWNERSHIP_REPAIRED = False
 
 EXCLUDE_PREFIXES = (
     ".cache",
@@ -104,6 +106,101 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def ensure_home_dir_ownership() -> None:
+    global OWNERSHIP_REPAIRED
+    owner = pwd.getpwnam(HOME_DIR.name)
+    target_owner = f"{owner.pw_uid}:{owner.pw_gid}"
+    completed = subprocess.run(
+        ["sudo", "chown", "-hR", target_owner, str(HOME_DIR)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        details = stderr or stdout or "unknown chown failure"
+        raise RuntimeError(f"Failed to force ownership of {HOME_DIR}: {details}")
+    OWNERSHIP_REPAIRED = True
+
+
+def copy_with_home_ownership_retry(source_path: Path, target_path: Path) -> None:
+    try:
+        shutil.copy2(source_path, target_path)
+    except PermissionError:
+        if OWNERSHIP_REPAIRED:
+            raise
+        ensure_home_dir_ownership()
+        shutil.copy2(source_path, target_path)
+
+
+def run_tar_with_pigz_once(
+    *, source_dir: Path, archive_path: Path, excludes: tuple[str, ...], pigz_processes: int
+) -> tuple[int, int, str, str]:
+    tar_command = ["tar", "-C", str(source_dir)]
+    for prefix in excludes:
+        tar_command.append(f"--exclude=./{prefix}")
+    tar_command.extend(["-cf", "-", "."])
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with archive_path.open("wb") as output:
+        tar_process = subprocess.Popen(
+            tar_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+        assert tar_process.stdout is not None
+
+        pigz_process = subprocess.Popen(
+            ["pigz", "-6", "-p", str(pigz_processes)],
+            stdin=tar_process.stdout,
+            stdout=output,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+        tar_process.stdout.close()
+
+        tar_stderr = tar_process.stderr.read().decode("utf-8", errors="ignore") if tar_process.stderr else ""
+        pigz_stderr = pigz_process.stderr.read().decode("utf-8", errors="ignore") if pigz_process.stderr else ""
+        pigz_return = pigz_process.wait()
+        tar_return = tar_process.wait()
+
+    return tar_return, pigz_return, tar_stderr, pigz_stderr
+
+
+def tar_run_succeeded(*, tar_return: int, pigz_return: int, tar_stderr: str) -> bool:
+    nonfatal_tar_warning = (
+        tar_return == 1
+        and tar_stderr.strip()
+        and all("file changed as we read it" in line for line in tar_stderr.splitlines() if line.strip())
+    )
+    return (tar_return == 0 or nonfatal_tar_warning) and pigz_return == 0
+
+
+def tar_failure_mentions_permission_denied(*, tar_stderr: str, pigz_stderr: str) -> bool:
+    combined = "\n".join(part for part in (tar_stderr, pigz_stderr) if part)
+    return "Permission denied" in combined
+
+
+def format_tar_failure(*, tar_stderr: str, pigz_stderr: str) -> RuntimeError:
+    return RuntimeError(
+        "Archive creation failed.\n"
+        + (tar_stderr.strip() + "\n" if tar_stderr.strip() else "")
+        + (pigz_stderr.strip() if pigz_stderr.strip() else "")
+    )
+
+
+def build_index_with_home_ownership_retry(root: Path) -> dict[str, dict]:
+    try:
+        return build_index(root)
+    except PermissionError:
+        if root != HOME_DIR or OWNERSHIP_REPAIRED:
+            raise
+        ensure_home_dir_ownership()
+        return build_index(root)
+
+
 def build_index(root: Path) -> dict[str, dict]:
     entries: dict[str, dict] = {}
 
@@ -144,48 +241,44 @@ def build_index(root: Path) -> dict[str, dict]:
 
 
 def run_tar_with_pigz(*, source_dir: Path, archive_path: Path, excludes: tuple[str, ...], pigz_processes: int) -> None:
-    tar_command = ["tar", "-C", str(source_dir)]
-    for prefix in excludes:
-        tar_command.append(f"--exclude=./{prefix}")
-    tar_command.extend(["-cf", "-", "."])
-
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    with archive_path.open("wb") as output:
-        tar_process = subprocess.Popen(
-            tar_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-        assert tar_process.stdout is not None
-
-        pigz_process = subprocess.Popen(
-            ["pigz", "-6", "-p", str(pigz_processes)],
-            stdin=tar_process.stdout,
-            stdout=output,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-        tar_process.stdout.close()
-
-        tar_stderr = tar_process.stderr.read().decode("utf-8", errors="ignore") if tar_process.stderr else ""
-        pigz_stderr = pigz_process.stderr.read().decode("utf-8", errors="ignore") if pigz_process.stderr else ""
-        pigz_return = pigz_process.wait()
-        tar_return = tar_process.wait()
-
-    nonfatal_tar_warning = (
-        tar_return == 1
-        and tar_stderr.strip()
-        and all("file changed as we read it" in line for line in tar_stderr.splitlines() if line.strip())
+    tar_return, pigz_return, tar_stderr, pigz_stderr = run_tar_with_pigz_once(
+        source_dir=source_dir,
+        archive_path=archive_path,
+        excludes=excludes,
+        pigz_processes=pigz_processes,
     )
+    if tar_run_succeeded(
+        tar_return=tar_return,
+        pigz_return=pigz_return,
+        tar_stderr=tar_stderr,
+    ):
+        return
 
-    if (tar_return != 0 and not nonfatal_tar_warning) or pigz_return != 0:
-        archive_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            "Archive creation failed.\n"
-            + (tar_stderr.strip() + "\n" if tar_stderr.strip() else "")
-            + (pigz_stderr.strip() if pigz_stderr.strip() else "")
+    if (
+        source_dir == HOME_DIR
+        and not OWNERSHIP_REPAIRED
+        and tar_failure_mentions_permission_denied(
+            tar_stderr=tar_stderr,
+            pigz_stderr=pigz_stderr,
         )
+    ):
+        archive_path.unlink(missing_ok=True)
+        ensure_home_dir_ownership()
+        tar_return, pigz_return, tar_stderr, pigz_stderr = run_tar_with_pigz_once(
+            source_dir=source_dir,
+            archive_path=archive_path,
+            excludes=excludes,
+            pigz_processes=pigz_processes,
+        )
+        if tar_run_succeeded(
+            tar_return=tar_return,
+            pigz_return=pigz_return,
+            tar_stderr=tar_stderr,
+        ):
+            return
+
+    archive_path.unlink(missing_ok=True)
+    raise format_tar_failure(tar_stderr=tar_stderr, pigz_stderr=pigz_stderr)
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -291,7 +384,7 @@ def stage_changed_entry(*, relative_label_path: str, entry: dict, stage_root: Pa
         target_path.unlink(missing_ok=True)
         os.symlink(os.readlink(source_path), target_path)
     elif entry["type"] == "file":
-        shutil.copy2(source_path, target_path)
+        copy_with_home_ownership_retry(source_path, target_path)
 
 
 def create_full_backup(*, pigz_processes: int) -> dict:
@@ -303,7 +396,7 @@ def create_full_backup(*, pigz_processes: int) -> dict:
     state_manifest_path = MANIFEST_DIR / f"{stem}.json"
     index_path = index_path_for(stem)
 
-    index = build_index(HOME_DIR)
+    index = build_index_with_home_ownership_retry(HOME_DIR)
     run_tar_with_pigz(
         source_dir=HOME_DIR,
         archive_path=archive_path,
@@ -355,7 +448,7 @@ def create_differential_backup(*, basis: BasisManifest, pigz_processes: int) -> 
 
     basis_index_path = INDEX_DIR / basis.data["local"]["index_name"]
     basis_index = load_manifest(basis_index_path)
-    current_index = build_index(HOME_DIR)
+    current_index = build_index_with_home_ownership_retry(HOME_DIR)
 
     changed_paths: list[str] = []
     for path, entry in current_index.items():
