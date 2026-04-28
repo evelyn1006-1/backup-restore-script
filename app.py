@@ -50,6 +50,12 @@ MAX_DISCORD_MESSAGE = 2000
 DISCORD_RETRY_ATTEMPTS = 6
 DISCORD_RETRY_INITIAL_SECONDS = 10
 DISCORD_RETRY_MAX_SECONDS = 300
+DISCORD_INSPECTION_ERRORS = (
+    discord.Forbidden,
+    discord.NotFound,
+    discord.HTTPException,
+    aiohttp.ClientError,
+)
 BACKUP_WARNING_DELETE_AFTER_SECONDS = 8
 BACKUP_WARNING_COOLDOWN_SECONDS = 30
 
@@ -215,7 +221,7 @@ async def create_backup_artifacts(mode: str) -> dict:
         "--mode",
         mode,
         "--retention-days",
-        "7",
+        "30",
         "--pigz-processes",
         "3",
         "--require-uploaded-basis",
@@ -566,6 +572,36 @@ def summarize_channel_names(channels: list[discord.TextChannel], *, limit: int =
     return ", ".join(names) if names else "none"
 
 
+def is_differential_backup_channel(channel: discord.TextChannel) -> bool:
+    return channel.name.startswith(backup_channel_prefix("differential"))
+
+
+async def fetch_backup_manifest_from_channel(
+    channel: discord.TextChannel,
+) -> dict | None:
+    async for message in channel.history(limit=50):
+        for attachment in message.attachments:
+            if not attachment.filename.endswith(".manifest.json"):
+                continue
+
+            contents = await with_discord_retries(
+                f"download manifest {attachment.filename}",
+                attachment.read,
+            )
+            try:
+                manifest = json.loads(contents.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Could not parse manifest attachment %s: %s",
+                    attachment.filename,
+                    exc,
+                )
+                return None
+
+            return manifest if isinstance(manifest, dict) else None
+    return None
+
+
 @app_commands.command(
     name="purge_backups",
     description="Delete backup channels in Backups older than the specified number of days.",
@@ -614,13 +650,17 @@ async def purge_backups_command(
         if days == 0
         else f"backup channels older than {days} day(s)"
     )
+    backup_channels = [
+        channel
+        for channel in guild.text_channels
+        if channel.category_id == category.id
+        and channel.name.startswith(f"{CHANNEL_PREFIX}-")
+    ]
     purge_candidates = sorted(
         [
             channel
-            for channel in guild.text_channels
-            if channel.category_id == category.id
-            and channel.name.startswith(f"{CHANNEL_PREFIX}-")
-            and channel.created_at <= cutoff
+            for channel in backup_channels
+            if channel.created_at <= cutoff
         ],
         key=lambda channel: channel.created_at,
     )
@@ -632,21 +672,116 @@ async def purge_backups_command(
         )
         return
 
-    if dry_run:
-        await interaction.followup.send(
-            "\n".join(
-                (
-                    "Dry run only; no channels were deleted.",
-                    f"Would delete {len(purge_candidates)} channel(s) from {threshold_label}.",
-                    f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
-                    f"Targets: {summarize_channel_names(purge_candidates)}",
+    candidate_full_channels = [
+        channel
+        for channel in purge_candidates
+        if not is_differential_backup_channel(channel)
+    ]
+    unreadable_retained_diff = False
+    protected_channel_ids: set[int] = set()
+    if candidate_full_channels:
+        candidate_ids = {channel.id for channel in purge_candidates}
+        basis_channel_ids: set[str] = set()
+        basis_channel_names: set[str] = set()
+        basis_archive_names: set[str] = set()
+
+        for diff_channel in backup_channels:
+            if (
+                diff_channel.id in candidate_ids
+                or not is_differential_backup_channel(diff_channel)
+            ):
+                continue
+            try:
+                manifest = await fetch_backup_manifest_from_channel(diff_channel)
+            except DISCORD_INSPECTION_ERRORS as exc:
+                logger.warning(
+                    "Could not inspect retained differential #%s: %s",
+                    diff_channel.name,
+                    exc,
                 )
+                unreadable_retained_diff = True
+                continue
+
+            if manifest is None or manifest.get("backup_type") != "differential":
+                unreadable_retained_diff = True
+                continue
+
+            basis = manifest.get("basis") or {}
+            if basis.get("channel_id") is not None:
+                basis_channel_ids.add(str(basis["channel_id"]))
+            if basis.get("channel_name") is not None:
+                basis_channel_names.add(str(basis["channel_name"]))
+            if basis.get("archive_name") is not None:
+                basis_archive_names.add(str(basis["archive_name"]))
+
+        for channel in candidate_full_channels:
+            if str(channel.id) in basis_channel_ids or channel.name in basis_channel_names:
+                protected_channel_ids.add(channel.id)
+
+        remaining_full_channels = [
+            channel for channel in candidate_full_channels if channel.id not in protected_channel_ids
+        ]
+        if unreadable_retained_diff:
+            for channel in remaining_full_channels:
+                protected_channel_ids.add(channel.id)
+        elif remaining_full_channels and basis_archive_names:
+            for channel in remaining_full_channels:
+                try:
+                    manifest = await fetch_backup_manifest_from_channel(channel)
+                except DISCORD_INSPECTION_ERRORS as exc:
+                    logger.warning("Could not inspect full backup #%s: %s", channel.name, exc)
+                    protected_channel_ids.add(channel.id)
+                    continue
+
+                archive_name = manifest.get("archive_name") if manifest is not None else None
+                if archive_name is None:
+                    protected_channel_ids.add(channel.id)
+                    continue
+
+                if str(archive_name) in basis_archive_names:
+                    protected_channel_ids.add(channel.id)
+
+    purge_candidates = [
+        channel for channel in purge_candidates if channel.id not in protected_channel_ids
+    ]
+    protected_names = [
+        channel
+        for channel in backup_channels
+        if channel.id in protected_channel_ids
+    ]
+
+    if not purge_candidates:
+        lines = [
+            f"No {threshold_label} can be safely purged.",
+            (
+                "Protected full backup channel(s): "
+                f"{summarize_channel_names(protected_names)}"
             ),
+            "Retained differential backups still need, or may still need, the protected full backups.",
+        ]
+        await interaction.followup.send(
+            "\n".join(lines),
             ephemeral=True,
         )
         return
 
+    if dry_run:
+        lines = [
+            "Dry run only; no channels were deleted.",
+            f"Would delete {len(purge_candidates)} channel(s) from {threshold_label}.",
+            f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+            f"Targets: {summarize_channel_names(purge_candidates)}",
+        ]
+        if protected_names:
+            lines.append(
+                "Protected full backup channel(s): "
+                f"{summarize_channel_names(protected_names)}"
+            )
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
     deleted_names = [channel.name for channel in purge_candidates]
+    protected_channel_names = [channel.name for channel in protected_names]
     reason = (
         f"Purged by {interaction.user} ({interaction.user.id}) "
         f"for being older than {days} day(s)"
@@ -667,21 +802,31 @@ async def purge_backups_command(
                 f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
                 f"Deleted channels: {len(deleted_names)}",
                 f"Deleted names: {', '.join(f'#{name}' for name in deleted_names)}",
+                f"Protected full backup channels: {len(protected_channel_names)}",
+                (
+                    "Protected names: "
+                    + (
+                        ", ".join(f"#{name}" for name in protected_channel_names)
+                        if protected_channel_names
+                        else "none"
+                    )
+                ),
             )
         )
     )
 
-    await interaction.followup.send(
-        "\n".join(
-            (
-                f"Deleted {len(deleted_names)} channel(s) from {threshold_label}.",
-                f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
-                f"Deleted: {', '.join(f'`#{name}`' for name in deleted_names[:15])}"
-                + (f", ... and {len(deleted_names) - 15} more" if len(deleted_names) > 15 else ""),
-            )
-        ),
-        ephemeral=True,
-    )
+    lines = [
+        f"Deleted {len(deleted_names)} channel(s) from {threshold_label}.",
+        f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+        f"Deleted: {', '.join(f'`#{name}`' for name in deleted_names[:15])}"
+        + (f", ... and {len(deleted_names) - 15} more" if len(deleted_names) > 15 else ""),
+    ]
+    if protected_names:
+        lines.append(
+            "Protected full backup channel(s): "
+            f"{summarize_channel_names(protected_names)}"
+        )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 async def handle_backup_signal(client: discord.Client, signal_command: str) -> None:

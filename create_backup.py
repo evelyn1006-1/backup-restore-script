@@ -28,6 +28,7 @@ OWNERSHIP_REPAIRED = False
 
 EXCLUDE_PREFIXES = (
     ".cache",
+    ".npm/_cacache",
     ".local/share/Trash",
     ".local/share/code-server/extensions",
     ".local/share/code-server/logs",
@@ -44,6 +45,7 @@ EXCLUDE_PREFIXES = (
     "bootstrap",
     ".rustup",
     ".julia",
+    ".u2net",
 )
 
 
@@ -62,7 +64,7 @@ def parser() -> argparse.ArgumentParser:
         choices=("full", "differential", "auto"),
         default="full",
     )
-    arg_parser.add_argument("--retention-days", type=int, default=7)
+    arg_parser.add_argument("--retention-days", type=int, default=30)
     arg_parser.add_argument(
         "--require-uploaded-basis",
         action="store_true",

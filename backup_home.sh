@@ -9,7 +9,7 @@ ARTIFACT_DIR="${BACKUP_DIR}/artifacts"
 STATE_DIR="${BACKUP_DIR}/state"
 RESULT_FILE="${STATE_DIR}/last_result.json"
 HELPER="${BACKUP_DIR}/create_backup.py"
-RETENTION_DAYS=7
+RETENTION_DAYS=30
 PIGZ_PROCESSES=3
 MODE="${1:-full}"
 
