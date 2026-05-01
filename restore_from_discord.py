@@ -678,9 +678,11 @@ def download_archive_from_messages(
     return restored_path, actual_sha256
 
 
-def assert_safe_tar_members(archive_path: Path) -> None:
+def assert_safe_tar_members(archive_path: Path) -> int:
+    member_count = 0
     with tarfile.open(archive_path, "r:gz") as archive:
         for member in archive:
+            member_count += 1
             path = Path(member.name)
             if path.is_absolute() or ".." in path.parts:
                 raise SystemExit(f"Refusing to extract unsafe tar member: {member.name}")
@@ -690,6 +692,7 @@ def assert_safe_tar_members(archive_path: Path) -> None:
                     raise SystemExit(
                         f"Refusing to extract unsafe hardlink member: {member.name}"
                     )
+    return member_count
 
 
 def backup_restore_filter(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
@@ -716,16 +719,101 @@ def prepare_extract_dir(extract_dir: Path, *, overwrite: bool) -> Path:
 
 
 def extract_archive(archive_path: Path, *, extract_dir: Path | None, overwrite: bool) -> Path:
-    assert_safe_tar_members(archive_path)
+    member_count = assert_safe_tar_members(archive_path)
     target_dir = prepare_extract_dir(
         extract_dir or default_extract_dir_for(archive_path),
         overwrite=overwrite,
     )
 
+    print(f"extracting={archive_path} target={target_dir} total_members={member_count}")
     with tarfile.open(archive_path, "r:gz") as archive:
         archive.extractall(target_dir, filter=backup_restore_filter)
 
     return target_dir
+
+
+def remove_existing_member_target(
+    extract_dir: Path,
+    member: tarfile.TarInfo,
+    changed_modes: dict[Path, int],
+) -> None:
+    """Make room for a tar member without deleting mergeable directories."""
+    relative = Path(member.name)
+    target = extract_dir / relative
+
+    if member.isdir():
+        if target.exists() and not target.is_dir():
+            target.unlink()
+        elif target.is_symlink():
+            target.unlink()
+        return
+
+    if target.is_dir() and not target.is_symlink():
+        make_directory_tree_writable(target, changed_modes)
+        shutil.rmtree(target)
+    elif target.exists() or target.is_symlink():
+        target.unlink()
+
+
+def make_directory_tree_writable(directory: Path, changed_modes: dict[Path, int]) -> None:
+    if not directory.exists() or not directory.is_dir() or directory.is_symlink():
+        return
+
+    current_mode = directory.stat().st_mode & 0o7777
+    changed_modes.setdefault(directory, current_mode)
+    directory.chmod(current_mode | 0o700)
+    with os.scandir(directory) as scanner:
+        for child in scanner:
+            if child.is_dir(follow_symlinks=False):
+                make_directory_tree_writable(Path(child.path), changed_modes)
+
+
+def make_directory_writable(directory: Path, changed_modes: dict[Path, int]) -> None:
+    if not directory.exists() or not directory.is_dir() or directory.is_symlink():
+        return
+
+    current_mode = directory.stat().st_mode & 0o7777
+    changed_modes.setdefault(directory, current_mode)
+    writable_mode = current_mode | 0o700
+    if writable_mode == current_mode:
+        return
+
+    directory.chmod(writable_mode)
+
+
+def restore_directory_modes(changed_modes: dict[Path, int]) -> None:
+    for directory, mode in sorted(
+        changed_modes.items(),
+        key=lambda item: len(item[0].parts),
+        reverse=True,
+    ):
+        if directory.exists() and directory.is_dir() and not directory.is_symlink():
+            directory.chmod(mode)
+
+
+def prepare_existing_member_targets(
+    archive_path: Path,
+    extract_dir: Path,
+    *,
+    member_count: int,
+    changed_modes: dict[Path, int],
+) -> set[Path]:
+    print(f"preparing_overlay={archive_path} target={extract_dir} total_members={member_count}")
+    archived_directories: set[Path] = set()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive:
+            relative = Path(member.name)
+            target = extract_dir / relative
+
+            if member.isdir():
+                archived_directories.add(target)
+                make_directory_writable(target, changed_modes)
+            if target.parent not in archived_directories:
+                make_directory_writable(target.parent, changed_modes)
+
+            remove_existing_member_target(extract_dir, member, changed_modes)
+
+    return archived_directories
 
 
 def apply_deleted_paths(extract_dir: Path, deleted_paths_file: Path) -> None:
@@ -742,9 +830,26 @@ def apply_deleted_paths(extract_dir: Path, deleted_paths_file: Path) -> None:
 
 
 def extract_into_existing_directory(archive_path: Path, extract_dir: Path) -> None:
-    assert_safe_tar_members(archive_path)
-    with tarfile.open(archive_path, "r:gz") as archive:
-        archive.extractall(extract_dir, filter=backup_restore_filter)
+    member_count = assert_safe_tar_members(archive_path)
+    changed_modes: dict[Path, int] = {}
+    archived_directories: set[Path] = set()
+    extraction_succeeded = False
+    try:
+        archived_directories = prepare_existing_member_targets(
+            archive_path,
+            extract_dir,
+            member_count=member_count,
+            changed_modes=changed_modes,
+        )
+        print(f"extracting_overlay={archive_path} target={extract_dir} total_members={member_count}")
+        with tarfile.open(archive_path, "r:gz") as archive:
+            archive.extractall(extract_dir, filter=backup_restore_filter)
+        extraction_succeeded = True
+    finally:
+        if extraction_succeeded:
+            for directory in archived_directories:
+                changed_modes.pop(directory, None)
+        restore_directory_modes(changed_modes)
 
 
 def main() -> int:
