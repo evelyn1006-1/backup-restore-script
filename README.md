@@ -52,7 +52,7 @@ printf '1' > signal.txt
 Install the systemd unit, then reload and start:
 
 ```bash
-sudo install -o root -g root -m 0644 systemd/backup-discord-bot.service /etc/systemd/system/backup-discord-bot.service
+sudo install -o root -g root -m 0644 deploy/backup-discord-bot.service /etc/systemd/system/backup-discord-bot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now backup-discord-bot.service
 ```

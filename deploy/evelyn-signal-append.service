@@ -1,0 +1,8 @@
+[Unit]
+Description=Append 1 to /home/evelyn/backups/signal.txt
+
+[Service]
+Type=oneshot
+User=evelyn
+Group=evelyn
+ExecStart=/usr/bin/bash -lc 'printf "1\n" >> /home/evelyn/backups/signal.txt'

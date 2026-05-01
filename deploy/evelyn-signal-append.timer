@@ -1,0 +1,10 @@
+[Unit]
+Description=Run evelyn-signal-append.service daily
+
+[Timer]
+OnCalendar=*-*-* 19:00:00
+Persistent=true
+Unit=evelyn-signal-append.service
+
+[Install]
+WantedBy=timers.target
