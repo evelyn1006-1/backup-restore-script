@@ -10,7 +10,9 @@ import os
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +27,8 @@ STATE_DIR = BACKUP_ROOT_DIR / "state"
 INDEX_DIR = STATE_DIR / "indices"
 MANIFEST_DIR = STATE_DIR / "manifests"
 OWNERSHIP_REPAIRED = False
+ARCHIVE_CHANGE_RETRIES = 3
+ARCHIVE_CHANGE_RETRY_DELAY_SECONDS = 5
 
 EXCLUDE_PREFIXES = (
     ".cache",
@@ -185,6 +189,21 @@ def tar_failure_mentions_permission_denied(*, tar_stderr: str, pigz_stderr: str)
     return "Permission denied" in combined
 
 
+def tar_failure_is_retryable_file_change(*, tar_return: int, pigz_return: int, tar_stderr: str) -> bool:
+    if tar_return != 1 or pigz_return != 0 or not tar_stderr.strip():
+        return False
+
+    retryable_fragments = (
+        "file changed as we read it",
+        "File shrank by",
+    )
+    return all(
+        any(fragment in line for fragment in retryable_fragments)
+        for line in tar_stderr.splitlines()
+        if line.strip()
+    )
+
+
 def format_tar_failure(*, tar_stderr: str, pigz_stderr: str) -> RuntimeError:
     return RuntimeError(
         "Archive creation failed.\n"
@@ -243,29 +262,9 @@ def build_index(root: Path) -> dict[str, dict]:
 
 
 def run_tar_with_pigz(*, source_dir: Path, archive_path: Path, excludes: tuple[str, ...], pigz_processes: int) -> None:
-    tar_return, pigz_return, tar_stderr, pigz_stderr = run_tar_with_pigz_once(
-        source_dir=source_dir,
-        archive_path=archive_path,
-        excludes=excludes,
-        pigz_processes=pigz_processes,
-    )
-    if tar_run_succeeded(
-        tar_return=tar_return,
-        pigz_return=pigz_return,
-        tar_stderr=tar_stderr,
-    ):
-        return
+    max_attempts = ARCHIVE_CHANGE_RETRIES + 1
 
-    if (
-        source_dir == HOME_DIR
-        and not OWNERSHIP_REPAIRED
-        and tar_failure_mentions_permission_denied(
-            tar_stderr=tar_stderr,
-            pigz_stderr=pigz_stderr,
-        )
-    ):
-        archive_path.unlink(missing_ok=True)
-        ensure_home_dir_ownership()
+    for attempt in range(1, max_attempts + 1):
         tar_return, pigz_return, tar_stderr, pigz_stderr = run_tar_with_pigz_once(
             source_dir=source_dir,
             archive_path=archive_path,
@@ -279,8 +278,48 @@ def run_tar_with_pigz(*, source_dir: Path, archive_path: Path, excludes: tuple[s
         ):
             return
 
-    archive_path.unlink(missing_ok=True)
-    raise format_tar_failure(tar_stderr=tar_stderr, pigz_stderr=pigz_stderr)
+        if (
+            source_dir == HOME_DIR
+            and not OWNERSHIP_REPAIRED
+            and tar_failure_mentions_permission_denied(
+                tar_stderr=tar_stderr,
+                pigz_stderr=pigz_stderr,
+            )
+        ):
+            archive_path.unlink(missing_ok=True)
+            ensure_home_dir_ownership()
+            tar_return, pigz_return, tar_stderr, pigz_stderr = run_tar_with_pigz_once(
+                source_dir=source_dir,
+                archive_path=archive_path,
+                excludes=excludes,
+                pigz_processes=pigz_processes,
+            )
+            if tar_run_succeeded(
+                tar_return=tar_return,
+                pigz_return=pigz_return,
+                tar_stderr=tar_stderr,
+            ):
+                return
+
+        if (
+            attempt < max_attempts
+            and tar_failure_is_retryable_file_change(
+                tar_return=tar_return,
+                pigz_return=pigz_return,
+                tar_stderr=tar_stderr,
+            )
+        ):
+            archive_path.unlink(missing_ok=True)
+            print(
+                "Archive input changed during read; "
+                f"retrying attempt {attempt + 1}/{max_attempts}",
+                file=sys.stderr,
+            )
+            time.sleep(ARCHIVE_CHANGE_RETRY_DELAY_SECONDS)
+            continue
+
+        archive_path.unlink(missing_ok=True)
+        raise format_tar_failure(tar_stderr=tar_stderr, pigz_stderr=pigz_stderr)
 
 
 def write_json(path: Path, payload: dict) -> None:
