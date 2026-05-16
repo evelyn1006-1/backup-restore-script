@@ -45,6 +45,7 @@ EXCLUDE_PREFIXES = (
     ".local/state/claude/locks",
     "backups/artifacts",
     "backups/__pycache__",
+    "homepage/static/videos",
     ".gunicorn",
     "bootstrap",
     ".rustup",
