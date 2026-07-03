@@ -15,6 +15,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path
 from stat import S_IMODE
 
@@ -30,7 +31,7 @@ OWNERSHIP_REPAIRED = False
 ARCHIVE_CHANGE_RETRIES = 3
 ARCHIVE_CHANGE_RETRY_DELAY_SECONDS = 5
 
-EXCLUDE_PREFIXES = (
+EXCLUDE_PATTERNS = (
     ".cache",
     ".npm/_cacache",
     ".local/share/Trash",
@@ -45,6 +46,8 @@ EXCLUDE_PREFIXES = (
     ".local/state/claude/locks",
     "backups/artifacts",
     "backups/__pycache__",
+    "discord-backup-restore",
+    "restored-home_backup_*",
     "homepage/static/videos",
     ".gunicorn",
     "bootstrap",
@@ -100,8 +103,9 @@ def is_excluded(relative_path: Path) -> bool:
         return False
     relative_posix = relative_path.as_posix()
     return any(
-        relative_posix == prefix or relative_posix.startswith(f"{prefix}/")
-        for prefix in EXCLUDE_PREFIXES
+        fnmatchcase(relative_posix, pattern)
+        or relative_posix.startswith(f"{pattern}/")
+        for pattern in EXCLUDE_PATTERNS
     )
 
 
@@ -442,7 +446,7 @@ def create_full_backup(*, pigz_processes: int) -> dict:
     run_tar_with_pigz(
         source_dir=HOME_DIR,
         archive_path=archive_path,
-        excludes=EXCLUDE_PREFIXES,
+        excludes=EXCLUDE_PATTERNS,
         pigz_processes=pigz_processes,
     )
 

@@ -611,11 +611,13 @@ async def fetch_backup_manifest_from_channel(
 @app_commands.describe(
     days="Delete channels older than this many days. Use 0 to delete all backup channels.",
     dry_run="Preview which channels would be deleted without actually deleting them.",
+    preserve_full_backups="Never delete full backup channels, even if they match the age cutoff.",
 )
 async def purge_backups_command(
     interaction: discord.Interaction,
     days: app_commands.Range[int, 0, 3650],
     dry_run: bool = False,
+    preserve_full_backups: bool = False,
 ) -> None:
     member = interaction.user
     permissions = getattr(member, "guild_permissions", None)
@@ -679,7 +681,10 @@ async def purge_backups_command(
     ]
     unreadable_retained_diff = False
     protected_channel_ids: set[int] = set()
-    if candidate_full_channels:
+    if preserve_full_backups:
+        protected_channel_ids.update(channel.id for channel in candidate_full_channels)
+
+    if candidate_full_channels and not preserve_full_backups:
         candidate_ids = {channel.id for channel in purge_candidates}
         basis_channel_ids: set[str] = set()
         basis_channel_names: set[str] = set()
@@ -757,8 +762,14 @@ async def purge_backups_command(
                 "Protected full backup channel(s): "
                 f"{summarize_channel_names(protected_names)}"
             ),
-            "Retained differential backups still need, or may still need, the protected full backups.",
         ]
+        if preserve_full_backups:
+            lines.append("Full backup preservation is enabled for this purge.")
+        else:
+            lines.append(
+                "Retained differential backups still need, or may still need, "
+                "the protected full backups."
+            )
         await interaction.followup.send(
             "\n".join(lines),
             ephemeral=True,
@@ -770,6 +781,7 @@ async def purge_backups_command(
             "Dry run only; no channels were deleted.",
             f"Would delete {len(purge_candidates)} channel(s) from {threshold_label}.",
             f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+            f"Always preserve full backups: {'yes' if preserve_full_backups else 'no'}",
             f"Targets: {summarize_channel_names(purge_candidates)}",
         ]
         if protected_names:
@@ -800,6 +812,7 @@ async def purge_backups_command(
                 f"Threshold: {threshold_label}",
                 f"Days threshold: {days}",
                 f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+                f"Always preserve full backups: {'yes' if preserve_full_backups else 'no'}",
                 f"Deleted channels: {len(deleted_names)}",
                 f"Deleted names: {', '.join(f'#{name}' for name in deleted_names)}",
                 f"Protected full backup channels: {len(protected_channel_names)}",
@@ -818,6 +831,7 @@ async def purge_backups_command(
     lines = [
         f"Deleted {len(deleted_names)} channel(s) from {threshold_label}.",
         f"Cutoff: {cutoff.isoformat(timespec='seconds')}",
+        f"Always preserve full backups: {'yes' if preserve_full_backups else 'no'}",
         f"Deleted: {', '.join(f'`#{name}`' for name in deleted_names[:15])}"
         + (f", ... and {len(deleted_names) - 15} more" if len(deleted_names) > 15 else ""),
     ]

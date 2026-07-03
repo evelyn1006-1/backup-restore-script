@@ -63,6 +63,12 @@ Watch logs:
 sudo journalctl -u backup-discord-bot.service -f
 ```
 
+## Discord Commands
+
+Use `/purge_backups` to delete backup channels under the `Backups` category by age.
+Set `dry_run` to preview the purge, and set `preserve_full_backups` to keep full
+backup channels even when they match the age cutoff.
+
 ## Restore
 
 On a fresh machine, export a bot token and the Discord backup target, then run:
