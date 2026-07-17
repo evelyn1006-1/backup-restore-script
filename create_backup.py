@@ -45,15 +45,19 @@ EXCLUDE_PATTERNS = (
     ".local/share/claude/versions",
     ".local/state/claude/locks",
     "backups/artifacts",
-    "backups/__pycache__",
     "discord-backup-restore",
     "restored-home_backup_*",
-    "homepage/static/videos",
     ".gunicorn",
     "bootstrap",
     ".rustup",
     ".julia",
     ".u2net",
+    ".cargo/registry",
+    ".cargo/git",
+    ".codex/cache",
+    ".local/share/codex-auto-compaction",
+    "*/__pycache__",
+    "*/node_modules",
 )
 
 
@@ -72,7 +76,26 @@ def parser() -> argparse.ArgumentParser:
         choices=("full", "differential", "auto"),
         default="full",
     )
-    arg_parser.add_argument("--retention-days", type=int, default=30)
+    arg_parser.add_argument(
+        "--full-interval-days",
+        "--retention-days",
+        dest="full_interval_days",
+        type=int,
+        default=14,
+        help="Create a fresh full backup when the newest usable full basis is older than this.",
+    )
+    arg_parser.add_argument(
+        "--prune-uploaded-days",
+        type=int,
+        default=7,
+        help="Delete local artifacts already uploaded to Discord after this many days (0 disables).",
+    )
+    arg_parser.add_argument(
+        "--prune-unuploaded-days",
+        type=int,
+        default=21,
+        help="Delete local artifacts never uploaded to Discord after this many days (0 disables).",
+    )
     arg_parser.add_argument(
         "--require-uploaded-basis",
         action="store_true",
@@ -581,6 +604,35 @@ def create_differential_backup(*, basis: BasisManifest, pigz_processes: int) -> 
     }
 
 
+def prune_artifacts(*, uploaded_days: int, unuploaded_days: int) -> list[str]:
+    """Delete aged artifact files; Discord holds uploaded copies, and diffs
+    only need state/, so local archives are pure cache after upload."""
+    now = utc_now()
+    pruned: list[str] = []
+
+    for manifest_path in sorted(ARTIFACTS_DIR.glob("*.manifest.json")):
+        try:
+            manifest = load_manifest(manifest_path)
+            created_at = manifest_created_at(manifest)
+        except Exception:
+            continue
+
+        uploaded = bool(manifest.get("upload", {}).get("channel_id"))
+        max_age_days = uploaded_days if uploaded else unuploaded_days
+        if max_age_days <= 0 or created_at > now - timedelta(days=max_age_days):
+            continue
+
+        targets = [ARTIFACTS_DIR / manifest["archive_name"], manifest_path]
+        deleted_paths_name = manifest.get("deleted_paths_name")
+        if deleted_paths_name:
+            targets.append(ARTIFACTS_DIR / deleted_paths_name)
+        for target in targets:
+            target.unlink(missing_ok=True)
+        pruned.append(manifest["archive_name"])
+
+    return pruned
+
+
 def main() -> int:
     args = parser().parse_args()
 
@@ -593,25 +645,25 @@ def main() -> int:
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
 
     basis = latest_full_manifest(
-        max_age_days=args.retention_days,
+        max_age_days=args.full_interval_days,
         require_uploaded=args.require_uploaded_basis,
     )
     mode = args.mode
     if mode == "auto":
         mode = "differential" if basis is not None else "full"
 
-    if mode == "differential":
-        if basis is None:
-            mode = "full"
-        else:
-            result = create_differential_backup(
-                basis=basis,
-                pigz_processes=args.pigz_processes,
-            )
-            print(json.dumps(result))
-            return 0
+    if mode == "differential" and basis is not None:
+        result = create_differential_backup(
+            basis=basis,
+            pigz_processes=args.pigz_processes,
+        )
+    else:
+        result = create_full_backup(pigz_processes=args.pigz_processes)
 
-    result = create_full_backup(pigz_processes=args.pigz_processes)
+    result["pruned_artifacts"] = prune_artifacts(
+        uploaded_days=args.prune_uploaded_days,
+        unuploaded_days=args.prune_unuploaded_days,
+    )
     print(json.dumps(result))
     return 0
 

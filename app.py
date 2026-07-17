@@ -220,8 +220,6 @@ async def create_backup_artifacts(mode: str) -> dict:
         str(BACKUP_HELPER),
         "--mode",
         mode,
-        "--retention-days",
-        "30",
         "--pigz-processes",
         "3",
         "--require-uploaded-basis",
